@@ -17,7 +17,11 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+try:
+    from adam_atan2 import AdamATan2
+except ImportError:
+    print("AdamATan2 not found, using AdamW")
+    from torch.optim import AdamW as AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -82,6 +86,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    grad_clip: Optional[float] = None # Gradient clipping max norm
 
 @dataclass
 class TrainState:
@@ -309,6 +314,10 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
+    
+    # Gradient clipping
+    if config.grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), config.grad_clip)
             
     # Apply optimizer
     lr_this_step = None    

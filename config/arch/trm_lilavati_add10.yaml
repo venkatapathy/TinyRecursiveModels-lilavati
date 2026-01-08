@@ -3,16 +3,17 @@ loss:
   name: losses_lilavati@ACTLossHeadLilavati
   loss_type: stablemax_cross_entropy
   carry_loss_weight: 0.1
+  digit_loss_weight: 0.1
 
-# Optimized for 10-digit (result up to 11 digits)
-num_columns: 12  # 11 digits + 1 margin
-bead_dim: 64
-abacus_layers: 4
+# SthanaYantra config optimized for 10-digit (result up to 11 digits)
+num_stambha: 12       # 11 digits + 1 margin (स्तम्भ)
+gulika_dim: 64        # Bead dimension (गुलिका)
+stambha_layers: 4     # Number of column processing layers
 kernel_size: 3
 
 # Halting config
 halt_exploration_prob: 0.05
-halt_max_steps: 16  # Match vanilla TRM config for 10-digit
+halt_max_steps: 16    # Match vanilla TRM config for 10-digit
 
 # Standard transformer config
 hidden_size: 512

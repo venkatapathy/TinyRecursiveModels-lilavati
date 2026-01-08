@@ -3,11 +3,12 @@ loss:
   name: losses_lilavati@ACTLossHeadLilavati
   loss_type: stablemax_cross_entropy
   carry_loss_weight: 0.1
+  digit_loss_weight: 0.1
 
-# Neural Abacus config
-num_columns: 25
-bead_dim: 64
-abacus_layers: 4
+# SthanaYantra config (स्थानयन्त्र - Place-value machine)
+num_stambha: 25       # Number of columns (स्तम्भ)
+gulika_dim: 64        # Bead dimension (गुलिका)
+stambha_layers: 4     # Number of column processing layers
 kernel_size: 3
 
 # Halting config

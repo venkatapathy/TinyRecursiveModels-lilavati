@@ -1,14 +1,16 @@
 """
-TRM Lilavati: Tiny Recursive Model with Neural Abacus architecture.
+TRM Lilavati: Tiny Recursive Model with SthanaYantra (स्थानयन्त्र) architecture.
 
-The Neural Abacus processes numbers in a columnar fashion, mimicking
-how the Lilavati algorithm (and humans) perform digit-by-digit addition
-with carry propagation.
+Implements Bhaskara II's Lilavati addition method (Saṅkalana - संकलन) where
+each Stambha (column) processes one digit position with proper carry
+propagation via HastaSanchara.
 
 Key features:
-- Columnar representation: z_abacus[batch, num_columns, bead_dim]
+- Columnar representation: z_sthana[batch, num_stambha, gulika_dim]
+- Direct digit-to-column mapping (no position collapse)
 - Local interactions via Conv1d (neighbors only)
-- Carry sweep via GRU (left-to-right for reversed digits)
+- Carry sweep via GRU (left-to-right for LSB to MSB)
+- Per-column digit prediction with supervision
 - Auxiliary carry prediction head
 """
 
@@ -24,11 +26,16 @@ from models.layers import rms_norm, SwiGLU, CastedEmbedding, CastedLinear
 
 IGNORE_LABEL_ID = -100
 
+# Vocabulary constants
+PLUS_TOKEN = 12  # '+' token
+EQ_TOKEN = 13    # '=' token
+DIGIT_OFFSET = 2  # Digits 0-9 map to tokens 2-11
+
 
 @dataclass
 class TRM_LilavatiInnerCarry:
-    """Carry state for Neural Abacus."""
-    z_abacus: torch.Tensor  # [batch, num_columns, bead_dim]
+    """Carry state for SthanaYantra (स्थानयन्त्र)."""
+    z_sthana: torch.Tensor  # [batch, num_stambha, gulika_dim]
 
 
 @dataclass
@@ -49,11 +56,11 @@ class TRM_LilavatiConfig(BaseModel):
     vocab_size: int
     num_puzzle_identifiers: int
     
-    # Neural Abacus config
-    num_columns: int = 25  # Number of digit positions
-    bead_dim: int = 64  # Representation dimension per column
-    abacus_layers: int = 4  # Number of abacus processing layers
-    kernel_size: int = 3  # Local convolution kernel size
+    # SthanaYantra config (स्थानयन्त्र - Place-value machine)
+    num_stambha: int = 25  # Number of columns (स्तम्भ)
+    gulika_dim: int = 64   # Bead dimension (गुलिका)
+    stambha_layers: int = 4  # Number of column processing layers
+    kernel_size: int = 3   # Local convolution kernel size
     
     # Standard config
     hidden_size: int = 512
@@ -70,23 +77,36 @@ class TRM_LilavatiConfig(BaseModel):
     
     # ACT config
     no_ACT_continue: bool = True
+    
+    # Backward compatibility aliases
+    @property
+    def num_columns(self) -> int:
+        return self.num_stambha
+    
+    @property
+    def bead_dim(self) -> int:
+        return self.gulika_dim
+    
+    @property
+    def abacus_layers(self) -> int:
+        return self.stambha_layers
 
 
-class AbacusLayer(nn.Module):
+class StambhaLayer(nn.Module):
     """
-    Single abacus processing layer.
+    Single column processing layer (स्तम्भ परिक्रमा - Stambha Parikrama).
     
     Combines local convolution (neighbor interaction) with MLP processing.
     All operations in float32 for stability with torch.compile.
     """
     
-    def __init__(self, bead_dim: int, kernel_size: int = 3, expansion: float = 4):
+    def __init__(self, gulika_dim: int, kernel_size: int = 3, expansion: float = 4):
         super().__init__()
         
         # Local convolution: each column sees itself + neighbors
         self.local_conv = nn.Conv1d(
-            in_channels=bead_dim,
-            out_channels=bead_dim,
+            in_channels=gulika_dim,
+            out_channels=gulika_dim,
             kernel_size=kernel_size,
             padding=kernel_size // 2,
             bias=False
@@ -94,7 +114,7 @@ class AbacusLayer(nn.Module):
         
         # MLP for per-column processing
         self.mlp = SwiGLU(
-            hidden_size=bead_dim,
+            hidden_size=gulika_dim,
             expansion=expansion,
         )
         
@@ -102,20 +122,20 @@ class AbacusLayer(nn.Module):
     
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Process abacus state.
+        Process column state.
         
         Args:
-            z: [batch, num_columns, bead_dim] - float32
+            z: [batch, num_stambha, gulika_dim] - float32
         
         Returns:
-            Updated z: [batch, num_columns, bead_dim] - float32
+            Updated z: [batch, num_stambha, gulika_dim] - float32
         """
         # Ensure float32 for all operations
         z = z.float()
         
         # Local convolution (transpose for Conv1d)
-        z_t = z.transpose(1, 2)  # [batch, bead_dim, num_columns]
-        z_conv = self.local_conv(z_t).transpose(1, 2)  # [batch, num_columns, bead_dim]
+        z_t = z.transpose(1, 2)  # [batch, gulika_dim, num_stambha]
+        z_conv = self.local_conv(z_t).transpose(1, 2)  # [batch, num_stambha, gulika_dim]
         z = rms_norm(z + z_conv, variance_epsilon=self.norm_eps)
         
         # MLP
@@ -124,17 +144,17 @@ class AbacusLayer(nn.Module):
         return z
 
 
-class CarrySweep(nn.Module):
+class HastaSanchara(nn.Module):
     """
-    Carry propagation via GRU sweep.
+    Carry propagation sweep (हस्त सञ्चार - Hasta Sanchara).
     
-    Processes columns left-to-right (since digits are reversed, this is LSB to MSB).
+    Processes columns left-to-right (LSB to MSB) to propagate carry information.
     All operations in float32 for stability.
     """
     
-    def __init__(self, bead_dim: int):
+    def __init__(self, gulika_dim: int):
         super().__init__()
-        self.gru_cell = nn.GRUCell(bead_dim, bead_dim)
+        self.gru_cell = nn.GRUCell(gulika_dim, gulika_dim)
         self.norm_eps = 1e-5
     
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -142,24 +162,24 @@ class CarrySweep(nn.Module):
         Sweep carry information across columns.
         
         Args:
-            z: [batch, num_columns, bead_dim] - float32
+            z: [batch, num_stambha, gulika_dim] - float32
         
         Returns:
-            Updated z with carry information propagated: [batch, num_columns, bead_dim] - float32
+            Updated z with carry information propagated: [batch, num_stambha, gulika_dim] - float32
         """
         # Ensure float32
         z = z.float()
-        batch, num_cols, bead_dim = z.shape
+        batch, num_stambha, gulika_dim = z.shape
         device = z.device
         
         # Initialize carry state (float32)
-        carry_state = torch.zeros(batch, bead_dim, device=device, dtype=torch.float32)
+        carry_state = torch.zeros(batch, gulika_dim, device=device, dtype=torch.float32)
         
         outputs = []
-        # Sweep left-to-right (LSB to MSB for reversed digits)
-        for col in range(num_cols):
+        # Sweep left-to-right (LSB to MSB)
+        for col in range(num_stambha):
             col_input = z[:, col, :]
-            # Update carry state with GRU (already float32)
+            # Update carry state with GRU
             carry_state = self.gru_cell(col_input, carry_state)
             outputs.append(carry_state)
         
@@ -167,9 +187,16 @@ class CarrySweep(nn.Module):
         return rms_norm(z + result, variance_epsilon=self.norm_eps)
 
 
-class NeuralAbacus(nn.Module):
+class SthanaYantra(nn.Module):
     """
-    Neural Abacus: Columnar processing for digit-by-digit arithmetic.
+    SthanaYantra (स्थानयन्त्र): Neural Place-Value Machine.
+    
+    Implements Bhaskara II's Lilavati addition method (Saṅkalana) where
+    each Stambha (column) processes one digit position with proper
+    carry propagation via HastaSanchara.
+    
+    Unlike the previous mean-pooling approach, this directly extracts
+    digit embeddings from their positions in the sequence.
     """
     
     def __init__(self, config: TRM_LilavatiConfig):
@@ -177,82 +204,130 @@ class NeuralAbacus(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, config.forward_dtype)
         
-        # Input projection: from sequence to abacus columns
-        self.input_proj = nn.Linear(config.hidden_size, config.num_columns * config.bead_dim)
+        # Per-column projection: from hidden_size to gulika_dim
+        self.stambha_proj = nn.Linear(config.hidden_size, config.gulika_dim)
         
-        # Abacus layers
+        # Stambha layers with HastaSanchara
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                'local': AbacusLayer(config.bead_dim, config.kernel_size, config.expansion),
-                'sweep': CarrySweep(config.bead_dim),
-            }) for _ in range(config.abacus_layers)
+                'stambha': StambhaLayer(config.gulika_dim, config.kernel_size, config.expansion),
+                'hasta': HastaSanchara(config.gulika_dim),
+            }) for _ in range(config.stambha_layers)
         ])
         
-        # Output projection: from abacus to sequence
-        self.output_proj = nn.Linear(config.num_columns * config.bead_dim, config.hidden_size)
+        # Output projection: from all columns to sequence space
+        self.output_proj = nn.Linear(config.num_stambha * config.gulika_dim, config.hidden_size)
         
-        # Digit prediction head (per column)
-        self.digit_head = nn.Linear(config.bead_dim, 10)
+        # Digit prediction head (per column) - predicts 0-9
+        self.digit_head = nn.Linear(config.gulika_dim, 10)
         
         # Carry prediction head (auxiliary)
-        self.carry_head = nn.Linear(config.bead_dim, 1)
+        self.carry_head = nn.Linear(config.gulika_dim, 1)
         
         self.norm_eps = config.rms_norm_eps
     
-    def forward(
+    def _gather_masked(
         self, 
         x: torch.Tensor, 
-        z_abacus: Optional[torch.Tensor] = None
+        positions: torch.Tensor, 
+        valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Gather embeddings at positions, zeroing invalid ones.
+        
+        Args:
+            x: [batch, seq_len, hidden_size]
+            positions: [batch] - positions to gather from
+            valid_mask: [batch] - boolean mask for valid positions
+        
+        Returns:
+            gathered: [batch, hidden_size] - embeddings at positions, zeroed if invalid
+        """
+        batch = x.shape[0]
+        # Clamp to valid range to avoid index errors
+        positions_clamped = positions.clamp(0, x.shape[1] - 1)
+        # Gather embeddings
+        gathered = x[torch.arange(batch, device=x.device), positions_clamped]
+        # Zero out invalid positions
+        return gathered * valid_mask.unsqueeze(-1).float()
+    
+    def forward(
+        self, 
+        x: torch.Tensor,
+        inputs: torch.Tensor,
+        z_sthana: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Process input through Neural Abacus.
+        Process input through SthanaYantra with proper digit extraction.
         
         Args:
             x: Input embeddings [batch, seq_len, hidden_size]
-            z_abacus: Previous abacus state (optional) [batch, num_columns, bead_dim]
+            inputs: Raw input tokens [batch, seq_len]
+            z_sthana: Previous column state (optional) [batch, num_stambha, gulika_dim]
         
         Returns:
-            - z_out: Updated abacus state [batch, num_columns, bead_dim]
+            - z_out: Updated column state [batch, num_stambha, gulika_dim]
             - output: Processed embeddings [batch, hidden_size]
-            - digit_logits: Per-column digit predictions [batch, num_columns, 10]
-            - carry_logits: Per-column carry predictions [batch, num_columns]
+            - digit_logits: Per-column digit predictions [batch, num_stambha, 10]
+            - carry_logits: Per-column carry predictions [batch, num_stambha]
         """
         batch = x.shape[0]
-        input_dtype = x.dtype
+        device = x.device
         
-        # Pool sequence and project to abacus (convert to float32 for processing)
-        x_pooled = x.mean(dim=1).float()  # [batch, hidden_size]
-        z = self.input_proj(x_pooled)  # [batch, num_columns * bead_dim]
-        z = z.view(batch, self.config.num_columns, self.config.bead_dim)
+        # Parse input to find operator positions
+        plus_pos = (inputs == PLUS_TOKEN).long().argmax(dim=1)  # Position of '+'
+        eq_pos = (inputs == EQ_TOKEN).long().argmax(dim=1)      # Position of '='
         
-        # Add previous state if available (convert to float32)
-        if z_abacus is not None:
-            z = z + z_abacus.float()
+        # Initialize each stambha (column) with its digit pair
+        z = torch.zeros(batch, self.config.num_stambha, self.config.gulika_dim, 
+                        device=device, dtype=torch.float32)
         
-        # Process through abacus layers (all in float32)
+        for stambha in range(self.config.num_stambha):
+            # Reversed indexing: stambha 0 = rightmost digit (LSB)
+            # A's digit at position (plus_pos - 1 - stambha)
+            # B's digit at position (eq_pos - 1 - stambha)
+            a_pos = plus_pos - 1 - stambha
+            b_pos = eq_pos - 1 - stambha
+            
+            # Bounds check
+            a_valid = (a_pos >= 0)
+            b_valid = (b_pos > plus_pos)  # B starts after '+'
+            
+            # Gather embeddings with masking
+            a_emb = self._gather_masked(x, a_pos, a_valid)
+            b_emb = self._gather_masked(x, b_pos, b_valid)
+            
+            # Project combined embedding to column dimension
+            z[:, stambha, :] = self.stambha_proj((a_emb + b_emb).float())
+        
+        # Add previous state if available
+        if z_sthana is not None:
+            z = z + z_sthana.float()
+        
+        # Process through stambha layers with hasta sanchara
         for layer in self.layers:
-            z = layer['local'](z)
-            z = layer['sweep'](z)
+            z = layer['stambha'](z)
+            z = layer['hasta'](z)
         
         # Digit predictions (per column)
-        digit_logits = self.digit_head(z)  # [batch, num_columns, 10]
+        digit_logits = self.digit_head(z)  # [batch, num_stambha, 10]
         
         # Carry predictions (per column)
-        carry_logits = self.carry_head(z).squeeze(-1)  # [batch, num_columns]
+        carry_logits = self.carry_head(z).squeeze(-1)  # [batch, num_stambha]
         
         # Project back to sequence space
-        z_flat = z.view(batch, -1)  # [batch, num_columns * bead_dim]
+        z_flat = z.view(batch, -1)  # [batch, num_stambha * gulika_dim]
         output = self.output_proj(z_flat)  # [batch, hidden_size]
         
         # Convert output back to input dtype for compatibility
-        output = output.to(input_dtype)
-        z_out = z.to(input_dtype)
+        output = output.to(x.dtype)
+        z_out = z.to(x.dtype)
         
         return z_out, output, digit_logits, carry_logits
 
 
 class TRM_Lilavati_Inner(nn.Module):
-    """Inner model for TRM Lilavati."""
+    """Inner model for TRM Lilavati with SthanaYantra."""
     
     def __init__(self, config: TRM_LilavatiConfig):
         super().__init__()
@@ -268,17 +343,17 @@ class TRM_Lilavati_Inner(nn.Module):
             init_std=embed_init_std, cast_to=self.forward_dtype
         )
         
-        # Neural Abacus
-        self.abacus = NeuralAbacus(config)
+        # SthanaYantra (replaces NeuralAbacus)
+        self.sthana_yantra = SthanaYantra(config)
         
         # Output heads
         self.lm_head = CastedLinear(config.hidden_size, config.vocab_size, bias=False)
         self.q_head = CastedLinear(config.hidden_size, 2, bias=True)
         
-        # Initial abacus state (float32 for stability)
-        self.abacus_init = nn.Parameter(
+        # Initial column state (float32 for stability)
+        self.sthana_init = nn.Parameter(
             trunc_normal_init_(
-                torch.empty(config.num_columns, config.bead_dim, dtype=torch.float32), 
+                torch.empty(config.num_stambha, config.gulika_dim, dtype=torch.float32), 
                 std=1
             )
         )
@@ -296,9 +371,9 @@ class TRM_Lilavati_Inner(nn.Module):
     def empty_carry(self, batch_size: int) -> TRM_LilavatiInnerCarry:
         """Create empty carry state."""
         return TRM_LilavatiInnerCarry(
-            z_abacus=torch.zeros(
-                batch_size, self.config.num_columns, self.config.bead_dim, 
-                dtype=torch.float32  # Use float32 for abacus state
+            z_sthana=torch.zeros(
+                batch_size, self.config.num_stambha, self.config.gulika_dim, 
+                dtype=torch.float32
             )
         )
     
@@ -309,10 +384,10 @@ class TRM_Lilavati_Inner(nn.Module):
     ) -> TRM_LilavatiInnerCarry:
         """Reset carry for halted sequences."""
         return TRM_LilavatiInnerCarry(
-            z_abacus=torch.where(
+            z_sthana=torch.where(
                 reset_flag.view(-1, 1, 1), 
-                self.abacus_init.unsqueeze(0).expand(carry.z_abacus.shape[0], -1, -1),
-                carry.z_abacus
+                self.sthana_init.unsqueeze(0).expand(carry.z_sthana.shape[0], -1, -1),
+                carry.z_sthana
             )
         )
     
@@ -322,48 +397,82 @@ class TRM_Lilavati_Inner(nn.Module):
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[TRM_LilavatiInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
         """
-        Forward pass.
+        Forward pass with direct stambha-to-sequence output mapping.
         
         Returns:
             - new_carry: Updated carry state
             - output: LM logits [batch, seq_len, vocab_size]
             - q_logits: (q_halt, q_continue)
-            - digit_logits: [batch, num_columns, 10]
-            - carry_logits: [batch, num_columns]
+            - digit_logits: [batch, num_stambha, 10]
+            - carry_logits: [batch, num_stambha]
         """
-        # Input embedding
-        input_embeddings = self._input_embeddings(batch["inputs"])
+        inputs = batch["inputs"]
+        batch_size = inputs.shape[0]
+        seq_len = inputs.shape[1]
+        device = inputs.device
         
-        # Process through abacus
-        new_z_abacus, abacus_output, digit_logits, carry_logits = self.abacus(
-            input_embeddings, carry.z_abacus
+        # Input embedding
+        input_embeddings = self._input_embeddings(inputs)
+        
+        # Process through SthanaYantra
+        new_z_sthana, sthana_output, digit_logits, carry_logits = self.sthana_yantra(
+            input_embeddings, inputs, carry.z_sthana
         )
         
-        # Broadcast abacus output to sequence length for LM head
-        batch_size, seq_len, _ = input_embeddings.shape
-        output_expanded = abacus_output.unsqueeze(1).expand(-1, seq_len, -1)
+        # Find result positions (after '=')
+        eq_pos = (inputs == EQ_TOKEN).long().argmax(dim=1)
         
-        # Combine with input embeddings for final output
+        # Build output logits - start with base LM output
+        output_expanded = sthana_output.unsqueeze(1).expand(-1, seq_len, -1)
         combined = input_embeddings + output_expanded
-        
-        # LM output
         output = self.lm_head(combined)
         
-        # Q-head (use pooled representation)
-        q_logits = self.q_head(abacus_output).to(torch.float32)
+        # Direct stambha-to-sequence mapping for result positions
+        # Override result positions with column digit predictions
+        labels = batch.get("labels", None)
+        if labels is not None:
+            # Count result digits from labels
+            for b in range(batch_size):
+                result_start = eq_pos[b] + 1
+                # Find how many result digits there are
+                result_mask = (labels[b, result_start:] != IGNORE_LABEL_ID) & (labels[b, result_start:] != 0)
+                num_result_digits = result_mask.sum().item()
+                
+                # Map each result position to its corresponding stambha
+                for col in range(int(num_result_digits)):
+                    seq_pos = result_start + col
+                    # Reverse mapping: leftmost result digit = highest stambha index
+                    stambha_idx = int(num_result_digits) - 1 - col
+                    if stambha_idx < self.config.num_stambha and seq_pos < seq_len:
+                        # Map digit logits (0-9) to vocab positions (2-11)
+                        output[b, seq_pos, DIGIT_OFFSET:DIGIT_OFFSET+10] = digit_logits[b, stambha_idx, :]
         
-        new_carry = TRM_LilavatiInnerCarry(z_abacus=new_z_abacus.detach())
+        # Q-head (use pooled representation)
+        q_logits = self.q_head(sthana_output).to(torch.float32)
+        
+        new_carry = TRM_LilavatiInnerCarry(z_sthana=new_z_sthana.detach())
         
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), digit_logits, carry_logits
 
 
 class TRM_Lilavati(nn.Module):
     """
-    TRM Lilavati: ACT wrapper for Neural Abacus model.
+    TRM Lilavati: ACT wrapper for SthanaYantra model.
+    
+    Implements Bhaskara II's Lilavati addition method with proper
+    place-value processing and carry propagation.
     """
     
     def __init__(self, config_dict: dict):
         super().__init__()
+        # Handle both old and new config parameter names
+        if 'num_columns' in config_dict and 'num_stambha' not in config_dict:
+            config_dict['num_stambha'] = config_dict.pop('num_columns')
+        if 'bead_dim' in config_dict and 'gulika_dim' not in config_dict:
+            config_dict['gulika_dim'] = config_dict.pop('bead_dim')
+        if 'abacus_layers' in config_dict and 'stambha_layers' not in config_dict:
+            config_dict['stambha_layers'] = config_dict.pop('abacus_layers')
+            
         self.config = TRM_LilavatiConfig(**config_dict)
         self.inner = TRM_Lilavati_Inner(self.config)
     

@@ -584,8 +584,11 @@ def launch(hydra_config: DictConfig):
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
-    except:
-        print("No evaluator found")
+        print(f"Created {len(evaluators)} evaluator(s): {[e.__class__.__name__ for e in evaluators]}")
+    except Exception as e:
+        print(f"No evaluator found: {e}")
+        import traceback
+        traceback.print_exc()
         evaluators = []
 
     # Train state
@@ -637,13 +640,22 @@ def launch(hydra_config: DictConfig):
                 eval_loader, 
                 eval_metadata, 
                 evaluators,
-                rank=RANK, 
+                rank=RANK,
                 world_size=WORLD_SIZE,
                 cpu_group=CPU_PROCESS_GROUP)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                
+                print(f"[Eval Metrics] Logging to wandb: {list(metrics.keys())}")
+                # Flatten nested dicts for logging
+                flat_metrics = {}
+                for k, v in metrics.items():
+                    if isinstance(v, dict):
+                        for k2, v2 in v.items():
+                            flat_metrics[f"{k}/{k2}"] = v2
+                    else:
+                        flat_metrics[k] = v
+                wandb.log(flat_metrics, step=train_state.step)
+
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")

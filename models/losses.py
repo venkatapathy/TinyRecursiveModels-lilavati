@@ -75,6 +75,12 @@ class ACTLossHead(nn.Module):
             metrics = {
                 "count": valid_metrics.sum(),
                 
+                # Digit-level accuracy (average over positions)
+                "digit_accuracy": torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+                # Sequence-level accuracy (all positions correct)
+                "sequence_accuracy": (valid_metrics & seq_is_correct).sum(),
+                
+                # Keep old names for backward compatibility
                 "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 

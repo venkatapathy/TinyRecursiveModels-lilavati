@@ -53,6 +53,10 @@ class PretrainConfig(pydantic.BaseModel):
     data_paths_test: List[str] = []
     # Evaluators
     evaluators: List[EvaluatorConfig] = []
+    
+    # Dataset mode
+    dataset_mode: str = "vanilla"  # "vanilla" or "lilavati1"
+    digits: int = 3
 
     # Hyperparams
     global_batch_size: int
@@ -285,7 +289,9 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
     for cfg in config.evaluators:
         for data_path in data_paths:
             cls = load_model_class(cfg.name, "evaluators.")(
-                data_path=data_path, eval_metadata=eval_metadata, **cfg.__pydantic_extra__
+                data_path=data_path, eval_metadata=eval_metadata, 
+                dataset_mode=config.dataset_mode, digits=config.digits,
+                **cfg.__pydantic_extra__
             )  # type: ignore
             evaluators.append(cls)
 
@@ -596,7 +602,34 @@ def launch(hydra_config: DictConfig):
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        
+        # Prepare W&B config with required fields
+        wandb_config = config.model_dump()
+        
+        # Set W&B project name based on dataset_mode
+        project_name = config.project_name if config.project_name is not None else "trm-lilavati"
+        
+        # Ensure run_name follows convention: vanilla_trm_d3 or lilavati1_trm_d3
+        run_name = config.run_name
+        if run_name is None:
+            if config.dataset_mode == "vanilla":
+                run_name = f"vanilla_trm_d{config.digits}"
+            elif config.dataset_mode == "lilavati1":
+                run_name = f"lilavati1_trm_d{config.digits}"
+            else:
+                run_name = f"{config.dataset_mode}_trm_d{config.digits}"
+        
+        # Set W&B config fields based on mode
+        wandb_config.update({
+            "model": "TRM",
+            "variant": config.dataset_mode,
+            "digits": config.digits,
+            "include_carry": config.dataset_mode == "lilavati1",
+        })
+        if config.dataset_mode == "lilavati1":
+            wandb_config["carry_token"] = "<CAR>"
+        
+        wandb.init(project=project_name, name=run_name, config=wandb_config, settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
     if config.ema:

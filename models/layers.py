@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Union
 import einops
 import torch
 from torch import nn
@@ -110,7 +110,7 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, return_attn_weights: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size, seq_len, _ = hidden_states.shape
 
         # hidden_states: [bs, seq_len, num_heads, head_dim]
@@ -127,12 +127,33 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
-        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
-        attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
-        attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
-        return self.o_proj(attn_output)
+        # Rearrange for attention computation
+        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value))
+        
+        if return_attn_weights:
+            # Compute attention manually to get weights
+            # attn_scores: [B, H, S, S]
+            attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            
+            # Apply causal mask if needed
+            if self.causal:
+                causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=attn_scores.dtype), diagonal=1)
+                attn_scores = attn_scores.masked_fill(causal_mask.bool().unsqueeze(0).unsqueeze(0), float('-inf'))
+            
+            # Softmax to get attention weights
+            attn_weights = F.softmax(attn_scores, dim=-1)  # [B, H, S, S]
+            
+            # Apply attention to values
+            attn_output = torch.matmul(attn_weights, value)  # [B, H, S, D]
+            attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
+            attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
+            return self.o_proj(attn_output), attn_weights
+        else:
+            # Use optimized scaled_dot_product_attention
+            attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
+            attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
+            attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
+            return self.o_proj(attn_output)
 
 class LinearSwish(nn.Module):
     def __init__(self, hidden_size: int, reverse=False):

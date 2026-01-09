@@ -293,19 +293,48 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
-    if train_state.step > train_state.total_steps:  # At most train_total_steps
-        return
+    # Note: Removed early return check - training is controlled by epoch loop, not step count
+    # The total_steps is just an estimate for LR scheduling purposes
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
 
-    # Init carry if it is None
-    if train_state.carry is None:
-        with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+    # Reset carry for each batch (like in evaluation)
+    # This ensures proper state management and prevents carry state from getting stuck
+    with torch.device("cuda"):
+        train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
-    # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    # Forward - ACT models need multiple steps like evaluation
+    # CRITICAL FIX: Loop through ACT steps until all sequences halt or max steps reached
+    # This allows the model to learn multi-step reasoning. Loss is accumulated across steps
+    # as per ACT standard practice - loss is computed on ALL sequences at each step.
+    total_loss = 0.0
+    step_count = 0
+    # Get max steps from inner model config
+    if hasattr(train_state.model, 'model') and hasattr(train_state.model.model, 'config'):
+        max_act_steps = train_state.model.model.config.halt_max_steps
+    else:
+        max_act_steps = 16
+    
+    metrics = None
+    while step_count < max_act_steps:
+        train_state.carry, step_loss, step_metrics, _, all_halted = train_state.model(
+            carry=train_state.carry, batch=batch, return_keys=[]
+        )
+        # Accumulate loss (gradients flow through all steps)
+        total_loss = total_loss + step_loss
+        step_count += 1
+        
+        # Use metrics from the last step (most up-to-date)
+        metrics = step_metrics
+        
+        # Break if all sequences have halted
+        if all_halted:
+            break
+    
+    # Use accumulated loss (not averaged) - this is standard ACT practice
+    # Each step contributes to learning, so we accumulate gradients across steps
+    loss = total_loss
 
     ((1 / global_batch_size) * loss).backward()
 
@@ -624,7 +653,7 @@ def launch(hydra_config: DictConfig):
             if config.ema:
                 ema_helper.update(train_state.model)
 
-        if _iter_id >= config.min_eval_interval:
+        if _iter_id >= config.min_eval_interval and eval_loader is not None and eval_metadata is not None:
             ############ Evaluation
             if RANK == 0:
                 print("EVALUATE")

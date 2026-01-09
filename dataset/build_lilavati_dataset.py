@@ -64,33 +64,54 @@ def reverse_digits(s: str) -> str:
 
 def compute_carries(a: int, b: int) -> list:
     """
-    Compute carry bits for addition a + b.
-    Returns list of carry bits (0 or 1) for each digit position.
-    Position 0 is the least significant digit.
+    Compute carry_out bits for addition a + b.
+    
+    CRITICAL: Returns carry_out[i] for each digit position i (LSB first).
+    
+    For each position i:
+        s[i] = a[i] + b[i] + carry_in[i]
+        result_digit[i] = s[i] % 10
+        carry_out[i] = s[i] // 10
+        carry_in[i+1] = carry_out[i]
+    
+    Args:
+        a: First operand
+        b: Second operand
+    
+    Returns:
+        carry_out: List of carry_out bits [c0, c1, c2, ...] where:
+            - c0 is carry_out from position 0 (ones digit)
+            - c1 is carry_out from position 1 (tens digit)
+            - Position 0 corresponds to the least significant digit
     """
-    s_a = str(a)
-    s_b = str(b)
+    s_a = str(a)[::-1]  # Reverse to LSB first
+    s_b = str(b)[::-1]  # Reverse to LSB first
     max_len = max(len(s_a), len(s_b))
     
-    # Pad to same length
-    s_a = s_a.zfill(max_len)
-    s_b = s_b.zfill(max_len)
+    # Pad to same length with zeros
+    s_a = s_a.ljust(max_len, '0')
+    s_b = s_b.ljust(max_len, '0')
     
-    carries = []
-    carry = 0
+    carry_out = []
+    carry_in = 0  # carry_in[0] = 0
     
-    # Process right-to-left (LSB first)
-    for i in range(max_len - 1, -1, -1):
+    # Process left-to-right (LSB to MSB in reversed representation)
+    for i in range(max_len):
         d_a = int(s_a[i])
         d_b = int(s_b[i])
-        total = d_a + d_b + carry
-        carry = 1 if total >= 10 else 0
-        carries.append(carry)
+        s = d_a + d_b + carry_in  # Total sum at position i
+        carry_out_i = s // 10  # carry_out[i]
+        carry_out.append(carry_out_i)
+        carry_in = carry_out_i  # carry_in[i+1] = carry_out[i]
     
-    # Final carry (if result has extra digit)
-    carries.append(carry)
+    # Final carry (for result digit at position max_len, if result has extra digit)
+    if carry_in > 0:
+        carry_out.append(0)  # No carry out from final position
+    else:
+        # Pad to ensure consistent length (will be padded to max_result_digits later)
+        pass
     
-    return carries
+    return carry_out
 
 
 def generate_random_number(max_digits: int, rng: np.random.Generator) -> int:

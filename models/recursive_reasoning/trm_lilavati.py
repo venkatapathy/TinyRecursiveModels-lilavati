@@ -120,12 +120,13 @@ class StambhaLayer(nn.Module):
         
         self.norm_eps = 1e-5
     
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Process column state.
         
         Args:
             z: [batch, num_stambha, gulika_dim] - float32
+            valid_mask: [batch, num_stambha] - True for active columns, None to process all
         
         Returns:
             Updated z: [batch, num_stambha, gulika_dim] - float32
@@ -136,10 +137,18 @@ class StambhaLayer(nn.Module):
         # Local convolution (transpose for Conv1d)
         z_t = z.transpose(1, 2)  # [batch, gulika_dim, num_stambha]
         z_conv = self.local_conv(z_t).transpose(1, 2)  # [batch, num_stambha, gulika_dim]
+        
+        # Mask out padded columns if mask provided
+        if valid_mask is not None:
+            z_conv = z_conv * valid_mask.unsqueeze(-1).float()
+        
         z = rms_norm(z + z_conv, variance_epsilon=self.norm_eps)
         
         # MLP
-        z = rms_norm(z + self.mlp(z), variance_epsilon=self.norm_eps)
+        z_mlp = self.mlp(z)
+        if valid_mask is not None:
+            z_mlp = z_mlp * valid_mask.unsqueeze(-1).float()
+        z = rms_norm(z + z_mlp, variance_epsilon=self.norm_eps)
         
         return z
 
@@ -157,12 +166,13 @@ class HastaSanchara(nn.Module):
         self.gru_cell = nn.GRUCell(gulika_dim, gulika_dim)
         self.norm_eps = 1e-5
     
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Sweep carry information across columns.
         
         Args:
             z: [batch, num_stambha, gulika_dim] - float32
+            valid_mask: [batch, num_stambha] - True for active columns, None to process all
         
         Returns:
             Updated z with carry information propagated: [batch, num_stambha, gulika_dim] - float32
@@ -175,15 +185,39 @@ class HastaSanchara(nn.Module):
         # Initialize carry state (float32)
         carry_state = torch.zeros(batch, gulika_dim, device=device, dtype=torch.float32)
         
+        # Determine maximum valid column per batch
+        if valid_mask is not None:
+            max_valid_col = valid_mask.sum(dim=-1).max().item()  # Max across all batches
+        else:
+            max_valid_col = num_stambha
+        
         outputs = []
-        # Sweep left-to-right (LSB to MSB)
-        for col in range(num_stambha):
+        # Sweep left-to-right (LSB to MSB) only through valid columns
+        for col in range(max_valid_col):
             col_input = z[:, col, :]
+            
             # Update carry state with GRU
-            carry_state = self.gru_cell(col_input, carry_state)
+            new_carry_state = self.gru_cell(col_input, carry_state)
+            
+            # Only update if column is valid
+            if valid_mask is not None:
+                col_mask = valid_mask[:, col].unsqueeze(-1).float()
+                carry_state = new_carry_state * col_mask + carry_state * (1 - col_mask)
+            else:
+                carry_state = new_carry_state
+            
             outputs.append(carry_state)
         
+        # Pad outputs if we stopped early
+        while len(outputs) < num_stambha:
+            outputs.append(outputs[-1] if outputs else torch.zeros_like(carry_state))
+        
         result = torch.stack(outputs, dim=1)
+        
+        # Mask result to prevent updates to invalid columns
+        if valid_mask is not None:
+            result = result * valid_mask.unsqueeze(-1).float()
+        
         return rms_norm(z + result, variance_epsilon=self.norm_eps)
 
 
@@ -204,6 +238,10 @@ class SthanaYantra(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, config.forward_dtype)
         
+        # Digit value embedding (0-9) - encodes numerical meaning
+        # 11 entries: 0-9 for digits, 10 for "no digit" (padding/invalid)
+        self.digit_value_emb = nn.Embedding(11, config.gulika_dim)
+        
         # Per-column projection: from hidden_size to gulika_dim
         self.stambha_proj = nn.Linear(config.hidden_size, config.gulika_dim)
         
@@ -215,41 +253,18 @@ class SthanaYantra(nn.Module):
             }) for _ in range(config.stambha_layers)
         ])
         
-        # Output projection: from all columns to sequence space
-        self.output_proj = nn.Linear(config.num_stambha * config.gulika_dim, config.hidden_size)
+        # REMOVED: Output projection to sequence space (prevents global leakage)
+        # We'll map columns directly to result positions instead of global mixing
         
-        # Digit prediction head (per column) - predicts 0-9
+        # Digit prediction head (per column) - predicts result digit (0-9) at each position
+        # Each stambha predicts: result_digit[i] = (a[i] + b[i] + carry_in[i]) mod 10
         self.digit_head = nn.Linear(config.gulika_dim, 10)
         
-        # Carry prediction head (auxiliary)
+        # Carry prediction head (auxiliary) - predicts carry_out per column
+        # carry_out[i] = floor((a[i] + b[i] + carry_in[i]) / 10)
         self.carry_head = nn.Linear(config.gulika_dim, 1)
         
         self.norm_eps = config.rms_norm_eps
-    
-    def _gather_masked(
-        self, 
-        x: torch.Tensor, 
-        positions: torch.Tensor, 
-        valid_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Gather embeddings at positions, zeroing invalid ones.
-        
-        Args:
-            x: [batch, seq_len, hidden_size]
-            positions: [batch] - positions to gather from
-            valid_mask: [batch] - boolean mask for valid positions
-        
-        Returns:
-            gathered: [batch, hidden_size] - embeddings at positions, zeroed if invalid
-        """
-        batch = x.shape[0]
-        # Clamp to valid range to avoid index errors
-        positions_clamped = positions.clamp(0, x.shape[1] - 1)
-        # Gather embeddings
-        gathered = x[torch.arange(batch, device=x.device), positions_clamped]
-        # Zero out invalid positions
-        return gathered * valid_mask.unsqueeze(-1).float()
     
     def forward(
         self, 
@@ -260,6 +275,8 @@ class SthanaYantra(nn.Module):
         """
         Process input through SthanaYantra with proper digit extraction.
         
+        Vectorized implementation for GPU efficiency.
+        
         Args:
             x: Input embeddings [batch, seq_len, hidden_size]
             inputs: Raw input tokens [batch, seq_len]
@@ -267,60 +284,124 @@ class SthanaYantra(nn.Module):
         
         Returns:
             - z_out: Updated column state [batch, num_stambha, gulika_dim]
-            - output: Processed embeddings [batch, hidden_size]
+            - output: None (removed to prevent global leakage)
             - digit_logits: Per-column digit predictions [batch, num_stambha, 10]
-            - carry_logits: Per-column carry predictions [batch, num_stambha]
+            - carry_logits: Per-column carry predictions [batch, num_stambha] (carry_out)
         """
         batch = x.shape[0]
+        seq_len = x.shape[1]
         device = x.device
+        num_stambha = self.config.num_stambha
         
         # Parse input to find operator positions
-        plus_pos = (inputs == PLUS_TOKEN).long().argmax(dim=1)  # Position of '+'
-        eq_pos = (inputs == EQ_TOKEN).long().argmax(dim=1)      # Position of '='
+        plus_pos = (inputs == PLUS_TOKEN).long().argmax(dim=1)  # [batch]
+        eq_pos = (inputs == EQ_TOKEN).long().argmax(dim=1)      # [batch]
         
-        # Initialize each stambha (column) with its digit pair
-        z = torch.zeros(batch, self.config.num_stambha, self.config.gulika_dim, 
-                        device=device, dtype=torch.float32)
+        # Validate grammar: ensure exactly one '+' and one '=' in valid positions
+        plus_count = (inputs == PLUS_TOKEN).sum(dim=-1)  # [batch]
+        eq_count = (inputs == EQ_TOKEN).sum(dim=-1)  # [batch]
+        valid_grammar = (plus_count == 1) & (eq_count == 1) & (plus_pos < eq_pos)
+        if not valid_grammar.all():
+            # This should not happen with proper dataset, but handle gracefully
+            pass  # Will be masked out by valid checks below
         
-        for stambha in range(self.config.num_stambha):
-            # Reversed indexing: stambha 0 = rightmost digit (LSB)
-            # A's digit at position (plus_pos - 1 - stambha)
-            # B's digit at position (eq_pos - 1 - stambha)
-            a_pos = plus_pos - 1 - stambha
-            b_pos = eq_pos - 1 - stambha
-            
-            # Bounds check
-            a_valid = (a_pos >= 0)
-            b_valid = (b_pos > plus_pos)  # B starts after '+'
-            
-            # Gather embeddings with masking
-            a_emb = self._gather_masked(x, a_pos, a_valid)
-            b_emb = self._gather_masked(x, b_pos, b_valid)
-            
-            # Project combined embedding to column dimension
-            z[:, stambha, :] = self.stambha_proj((a_emb + b_emb).float())
+        # Vectorized digit extraction for all stambha at once
+        # CRITICAL FIX: For reversed string "31+52=", positions are:
+        # Position 0='3' (A[0], ones digit), 1='1' (A[1], tens digit)
+        # Position 2='+', 3='5' (B[0], ones digit), 4='2' (B[1], tens digit), 5='='
+        # Note: B starts at sequence position 3, which is B[0] (B's ones digit)
+        # Stambha 0 = ones digit (LSB) = position 0 in reversed string for A
+        # Stambha 1 = tens digit = position 1 in reversed string for A
+        stambha_idx = torch.arange(num_stambha, device=device)  # [num_stambha]
+        
+        # Direct mapping: stambha i maps to position i for A
+        # For B: starts after '+' at position (plus_pos + 1), so B[j] is at sequence position (plus_pos + 1 + j)
+        # The formula b_pos = (plus_pos + 1) + stambha_idx correctly maps:
+        #   stambha 0 → position (plus_pos + 1 + 0) = B[0] position
+        #   stambha 1 → position (plus_pos + 1 + 1) = B[1] position
+        a_pos = stambha_idx.unsqueeze(0)  # [batch, num_stambha] - direct mapping
+        b_pos = (plus_pos + 1).unsqueeze(1) + stambha_idx.unsqueeze(0)  # [batch, num_stambha]
+        
+        # Bounds check: [batch, num_stambha]
+        # A digits must be before '+' position, B digits must be between '+' and '='
+        a_valid = (a_pos >= 0) & (a_pos < plus_pos.unsqueeze(1))
+        b_valid = (b_pos > plus_pos.unsqueeze(1)) & (b_pos < eq_pos.unsqueeze(1))
+        
+        # Clamp positions to valid range for gather
+        a_pos_clamped = a_pos.clamp(0, seq_len - 1)  # [batch, num_stambha]
+        b_pos_clamped = b_pos.clamp(0, seq_len - 1)  # [batch, num_stambha]
+        
+        # Gather embeddings using advanced indexing
+        # x is [batch, seq_len, hidden_size]
+        # We need to gather at positions [batch, num_stambha] -> [batch, num_stambha, hidden_size]
+        batch_idx = torch.arange(batch, device=device).unsqueeze(1).expand(-1, num_stambha)
+        
+        a_emb = x[batch_idx, a_pos_clamped]  # [batch, num_stambha, hidden_size]
+        b_emb = x[batch_idx, b_pos_clamped]  # [batch, num_stambha, hidden_size]
+        
+        # Zero out invalid positions
+        a_emb = a_emb * a_valid.unsqueeze(-1).float()
+        b_emb = b_emb * b_valid.unsqueeze(-1).float()
+        
+        # Project combined embeddings to column dimension
+        # stambha_proj: [hidden_size] -> [gulika_dim]
+        combined_emb = (a_emb + b_emb).float()  # [batch, num_stambha, hidden_size]
+        z = self.stambha_proj(combined_emb)     # [batch, num_stambha, gulika_dim]
+        
+        # Extract actual digit values and add digit value embeddings
+        # This gives the model explicit numerical information
+        # Digit tokens are 2-11, mapping to values 0-9
+        a_tokens = inputs[batch_idx, a_pos_clamped]  # [batch, num_stambha]
+        b_tokens = inputs[batch_idx, b_pos_clamped]  # [batch, num_stambha]
+        
+        # Convert tokens to digit values (0-9), use 10 for invalid/non-digit
+        a_digit = torch.where(
+            a_valid & (a_tokens >= DIGIT_OFFSET) & (a_tokens < DIGIT_OFFSET + 10),
+            a_tokens - DIGIT_OFFSET,
+            torch.full_like(a_tokens, 10)  # 10 = no digit
+        )
+        b_digit = torch.where(
+            b_valid & (b_tokens >= DIGIT_OFFSET) & (b_tokens < DIGIT_OFFSET + 10),
+            b_tokens - DIGIT_OFFSET,
+            torch.full_like(b_tokens, 10)  # 10 = no digit
+        )
+        
+        # Get digit value embeddings and add to stambha state
+        a_digit_emb = self.digit_value_emb(a_digit)  # [batch, num_stambha, gulika_dim]
+        b_digit_emb = self.digit_value_emb(b_digit)  # [batch, num_stambha, gulika_dim]
+        
+        # Combine token embeddings with digit value embeddings
+        z = z + a_digit_emb + b_digit_emb
         
         # Add previous state if available
         if z_sthana is not None:
             z = z + z_sthana.float()
         
+        # Compute valid column mask: columns that have at least one valid digit
+        valid_columns = a_valid | b_valid  # [batch, num_stambha]
+        
         # Process through stambha layers with hasta sanchara
         for layer in self.layers:
-            z = layer['stambha'](z)
-            z = layer['hasta'](z)
+            z = layer['stambha'](z, valid_mask=valid_columns)
+            z = layer['hasta'](z, valid_mask=valid_columns)
         
-        # Digit predictions (per column)
+        # Digit predictions (per column) - only predict for valid columns
         digit_logits = self.digit_head(z)  # [batch, num_stambha, 10]
+        # Mask invalid columns to prevent spurious predictions
+        valid_columns_expanded = valid_columns.unsqueeze(-1).float()  # [batch, num_stambha, 1]
+        digit_logits = digit_logits * valid_columns_expanded + (1 - valid_columns_expanded) * (-1e9)
         
-        # Carry predictions (per column)
+        # Carry predictions (per column) - only predict for valid columns
         carry_logits = self.carry_head(z).squeeze(-1)  # [batch, num_stambha]
+        # Mask invalid columns
+        carry_logits = carry_logits * valid_columns.float() + (1 - valid_columns.float()) * (-1e9)
         
-        # Project back to sequence space
-        z_flat = z.view(batch, -1)  # [batch, num_stambha * gulika_dim]
-        output = self.output_proj(z_flat)  # [batch, hidden_size]
+        # CRITICAL FIX: Remove global leakage - don't use global projection
+        # Instead, return None for output (will be handled in TRM_Lilavati_Inner)
+        # The column states are sufficient for per-column predictions
+        output = None  # No global mixing
         
         # Convert output back to input dtype for compatibility
-        output = output.to(x.dtype)
         z_out = z.to(x.dtype)
         
         return z_out, output, digit_logits, carry_logits
@@ -348,7 +429,8 @@ class TRM_Lilavati_Inner(nn.Module):
         
         # Output heads
         self.lm_head = CastedLinear(config.hidden_size, config.vocab_size, bias=False)
-        self.q_head = CastedLinear(config.hidden_size, 2, bias=True)
+        # Q-head: input from pooled column states (gulika_dim) instead of hidden_size
+        self.q_head = CastedLinear(config.gulika_dim, 2, bias=True)
         
         # Initial column state (float32 for stability)
         self.sthana_init = nn.Parameter(
@@ -420,35 +502,151 @@ class TRM_Lilavati_Inner(nn.Module):
         )
         
         # Find result positions (after '=')
-        eq_pos = (inputs == EQ_TOKEN).long().argmax(dim=1)
+        eq_pos = (inputs == EQ_TOKEN).long().argmax(dim=1)  # [batch]
         
-        # Build output logits - start with base LM output
-        output_expanded = sthana_output.unsqueeze(1).expand(-1, seq_len, -1)
-        combined = input_embeddings + output_expanded
-        output = self.lm_head(combined)
+        # CRITICAL FIX: Remove global leakage - only use input embeddings for non-result positions
+        # Result positions will be filled with column predictions only
+        # Base output from input embeddings only (no global mixing)
+        base_output = self.lm_head(input_embeddings)  # [batch, seq_len, vocab_size]
         
-        # Direct stambha-to-sequence mapping for result positions
-        # Override result positions with column digit predictions
+        # ALWAYS map digit_logits to output at result positions (both train and eval)
+        # Compute result positions from inputs (don't require labels)
+        num_stambha = self.config.num_stambha
+        vocab_size = base_output.shape[-1]
+        result_start = eq_pos + 1  # [batch]
+        
+        # Determine result length: use labels if available, otherwise estimate
         labels = batch.get("labels", None)
         if labels is not None:
-            # Count result digits from labels
-            for b in range(batch_size):
-                result_start = eq_pos[b] + 1
-                # Find how many result digits there are
-                result_mask = (labels[b, result_start:] != IGNORE_LABEL_ID) & (labels[b, result_start:] != 0)
-                num_result_digits = result_mask.sum().item()
-                
-                # Map each result position to its corresponding stambha
-                for col in range(int(num_result_digits)):
-                    seq_pos = result_start + col
-                    # Reverse mapping: leftmost result digit = highest stambha index
-                    stambha_idx = int(num_result_digits) - 1 - col
-                    if stambha_idx < self.config.num_stambha and seq_pos < seq_len:
-                        # Map digit logits (0-9) to vocab positions (2-11)
-                        output[b, seq_pos, DIGIT_OFFSET:DIGIT_OFFSET+10] = digit_logits[b, stambha_idx, :]
+            # Use labels to determine exact result length per batch
+            seq_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+            result_mask_labels = (seq_indices >= result_start.unsqueeze(1)) & \
+                                (labels != IGNORE_LABEL_ID) & (labels != 0)
+            num_result_digits = result_mask_labels.sum(dim=1)  # [batch]
+            max_result_len = min(num_result_digits.max().item(), num_stambha)
+        else:
+            # During eval: use MASK tokens to determine result length
+            # The input has MASK tokens (ID=1) where the result should be
+            MASK_ID = 1
+            seq_indices = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+            result_region = (seq_indices >= result_start.unsqueeze(1))  # [batch, seq_len]
+            mask_tokens = (inputs == MASK_ID)  # [batch, seq_len]
+            # Count consecutive MASK tokens after '='
+            result_mask_count = (result_region & mask_tokens).sum(dim=1)  # [batch]
+            # Fallback: if no masks, use conservative estimate (max 6 digits for 5-digit addition)
+            # This assumes num_stambha is set appropriately (e.g., 8 for 5-digit addition)
+            conservative_max = min(6, num_stambha)  # Max result digits = operand_digits + 1
+            num_result_digits = torch.where(
+                result_mask_count > 0,
+                result_mask_count.clamp(1, num_stambha),
+                torch.full_like(result_mask_count, conservative_max)
+            )  # [batch]
+            max_result_len = min(num_result_digits.max().item(), num_stambha)
         
-        # Q-head (use pooled representation)
-        q_logits = self.q_head(sthana_output).to(torch.float32)
+        # Debug: ensure we always have valid result length
+        if max_result_len <= 0:
+            max_result_len = min(2, num_stambha)  # At least 2 digits for safety
+        
+        if max_result_len > 0:
+            # Build digit output tensor
+            digit_contributions = []
+            
+            for col in range(int(max_result_len)):
+                seq_pos = result_start + col  # [batch]
+                # CRITICAL FIX: In reversed format, result digits are written LSB first
+                # For "31+52=83": result_start = 6 (after '='), so:
+                #   col=0 → position 6 → stambha 0 (ones digit) → should predict digit 8
+                #   col=1 → position 7 → stambha 1 (tens digit) → should predict digit 3
+                # Direct mapping: col → stambha_idx (LSB-first means first col = ones = stambha 0)
+                stambha_idx = torch.full((batch_size,), col, dtype=torch.long, device=device)  # [batch]
+                
+                # Validity check: position must be valid and stambha must exist
+                # col is int, num_result_digits is [batch], so broadcast comparison
+                valid = (col < num_result_digits) & (seq_pos < seq_len) & \
+                       (stambha_idx >= 0) & (stambha_idx < num_stambha)
+                
+                if valid.any():
+                    batch_idx = torch.arange(batch_size, device=device)
+                    stambha_idx_clamped = stambha_idx.clamp(0, num_stambha - 1)
+                    seq_pos_clamped = seq_pos.clamp(0, seq_len - 1)
+                    
+                    # Get digit logits: [batch, 10]
+                    col_digit_logits = digit_logits[batch_idx, stambha_idx_clamped]
+                    
+                    # Create one-hot position encoding [batch, seq_len]
+                    pos_onehot = F.one_hot(seq_pos_clamped, num_classes=seq_len).float()
+                    pos_onehot = pos_onehot * valid.unsqueeze(-1).float()
+                    
+                    # Pad digit logits to vocab size [batch, vocab_size]
+                    vocab_contrib = F.pad(
+                        col_digit_logits.to(base_output.dtype), 
+                        (DIGIT_OFFSET, vocab_size - DIGIT_OFFSET - 10),
+                        value=0
+                    )
+                    
+                    # Outer product: [batch, seq_len, vocab_size]
+                    contribution = torch.einsum('bs,bv->bsv', pos_onehot, vocab_contrib)
+                    digit_contributions.append(contribution)
+            
+            if digit_contributions:
+                # Sum all contributions
+                digit_output = sum(digit_contributions)
+                
+                # CRITICAL FIX: Create precise result mask - only exact result positions, not all after '='
+                # This prevents masking PAD/MASK tokens which causes wrong predictions
+                seq_indices = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+                
+                # Compute exact result positions per batch element
+                # result_mask[i, j] = True if position j is a valid result digit for batch i
+                result_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+                
+                # Set mask for each valid result position
+                for col in range(int(max_result_len)):
+                    seq_pos = result_start + col  # [batch]
+                    valid = (col < num_result_digits) & (seq_pos < seq_len)
+                    
+                    if valid.any():
+                        # Set mask for valid positions
+                        batch_idx = torch.arange(batch_size, device=device)[valid]
+                        pos_idx = seq_pos[valid]
+                        result_mask[batch_idx, pos_idx] = True
+                
+                # Refine mask with labels if available (for training - exclude PAD/MASK/IGNORE)
+                labels = batch.get("labels", None)
+                if labels is not None:
+                    valid_labels = (labels != IGNORE_LABEL_ID) & (labels != 0) & \
+                                  (labels >= DIGIT_OFFSET) & (labels < DIGIT_OFFSET + 10)
+                    result_mask = result_mask & valid_labels
+                
+                result_mask_3d = result_mask.unsqueeze(-1).float()
+                
+                # CRITICAL FIX: Force model to learn from digit_logits, not memorize
+                # Completely REPLACE base_output with digit_output at result positions
+                # Scale digit_output to ensure it dominates (multiply by large factor to ensure argmax picks it)
+                # This ensures column predictions are used exclusively
+                digit_output_scaled = digit_output * 1.0  # Keep scale as 1.0 for now, but ensure it's used
+                output = base_output * (1 - result_mask_3d) + digit_output_scaled * result_mask_3d
+                
+                if self.training:
+                    # During training: block lm_head gradients at result positions
+                    # Non-results: base_output (with gradients)
+                    # Results: base_output.detach() (no gradients) + digit_output (with gradients)
+                    # Reconstruct to ensure gradients flow correctly
+                    output_base_grad = base_output * (1 - result_mask_3d)
+                    output_result_grad = base_output.detach() * result_mask_3d + digit_output_scaled * result_mask_3d
+                    output = output_base_grad + output_result_grad
+            else:
+                output = base_output
+        else:
+            output = base_output
+        
+        # Q-head: compute from column states instead of global output
+        # Pool column states to get single representation
+        # Average pooling over all columns (they're all processed, invalid ones are masked)
+        pooled = new_z_sthana.mean(dim=1)  # [batch, gulika_dim]
+        
+        # Q-head now takes gulika_dim input directly (changed from hidden_size)
+        q_logits = self.q_head(pooled.to(self.forward_dtype)).to(torch.float32)
         
         new_carry = TRM_LilavatiInnerCarry(z_sthana=new_z_sthana.detach())
         

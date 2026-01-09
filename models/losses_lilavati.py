@@ -94,12 +94,15 @@ class ACTLossHeadLilavati(nn.Module):
             result_digits = result_tokens[valid_indices] - DIGIT_OFFSET
             num_result_digits = len(result_digits)
             
-            # Reverse to match stambha order (LSB first)
-            # stambha 0 = rightmost digit = result_digits[-1]
+            # CRITICAL FIX: In reversed format, result digits are already LSB-first in sequence
+            # Position 7 (first result) = LSB = stambha 0
+            # Position 8 = tens = stambha 1
+            # Position 9 (last result) = MSB = stambha 2
+            # So mapping is DIRECT (no reversal needed)
             for i in range(num_result_digits):
                 if i < num_stambha:
-                    # Reverse index: rightmost digit goes to stambha 0
-                    targets[b, i] = result_digits[num_result_digits - 1 - i]
+                    # Direct mapping: position i in sequence → stambha i
+                    targets[b, i] = result_digits[i]
         
         return targets
     
@@ -155,19 +158,75 @@ class ACTLossHeadLilavati(nn.Module):
             }
         
         # === Losses ===
+        # NOTE: In ACT, loss is computed on ALL sequences at each step, not just halted ones.
+        # This allows learning from all reasoning steps, not just the final halted state.
+        # Metrics are computed only on halted sequences (see valid_metrics above).
         
-        # 1. LM loss
-        lm_loss = (
-            self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) 
-            / loss_divisor
-        ).sum()
+        # Identify result positions (answer digits after '=') - these are CRITICAL
+        eq_pos = (inputs == EQ_TOKEN).long().argmax(dim=1)  # [batch]
+        seq_len = labels.shape[1]
+        seq_indices = torch.arange(seq_len, device=labels.device).unsqueeze(0)  # [1, seq_len]
+        result_mask = (seq_indices >= (eq_pos + 1).unsqueeze(1)) & mask  # [batch, seq_len]
         
-        # 2. Q-halt loss
-        q_halt_loss = F.binary_cross_entropy_with_logits(
-            outputs["q_halt_logits"], 
-            seq_is_correct.to(outputs["q_halt_logits"].dtype), 
-            reduction="sum"
+        # 1. LM loss - computed on all sequences
+        # CRITICAL: Weight result positions (answer digits) more heavily
+        # Result positions are 5x more important than other positions
+        per_token_loss = self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
+        
+        # Create position weights: 5.0 for result positions, 1.0 for others
+        position_weights = torch.where(result_mask, 5.0, 1.0)
+        weighted_loss = per_token_loss * position_weights
+        
+        # Normalize by weighted token count to keep scale consistent
+        weighted_token_count = (mask.float() * position_weights).sum().clamp_min(1.0)
+        lm_loss = weighted_loss.sum() / weighted_token_count
+        
+        # 2. Q-halt loss - computed on all sequences
+        # FIXED: Use confidence-based halting instead of binary correctness
+        batch_size = outputs["q_halt_logits"].shape[0]
+        
+        # Compute confidence from digit logits (for valid sequences)
+        if "digit_logits" in outputs:
+            digit_logits = outputs["digit_logits"]  # [batch, num_stambha, 10]
+            digit_probs = F.softmax(digit_logits, dim=-1)  # [batch, num_stambha, 10]
+            max_probs = digit_probs.max(dim=-1)[0]  # [batch, num_stambha] - confidence per column
+            # Average confidence across valid columns
+            # Mask out invalid predictions (very low logits from masking)
+            valid_mask = (digit_logits.max(dim=-1)[0] > -1e8).float()  # [batch, num_stambha]
+            num_valid_cols = valid_mask.sum(dim=-1).clamp_min(1.0)  # [batch]
+            confidence = (max_probs * valid_mask).sum(dim=-1) / num_valid_cols  # [batch]
+        else:
+            # Fallback: use uniform confidence if digit_logits not available
+            confidence = torch.ones(batch_size, device=outputs["q_halt_logits"].device) * 0.5
+        
+        # Target: halt when confidence > threshold (0.8)
+        confidence_threshold = 0.8
+        q_halt_targets = (confidence > confidence_threshold).float()
+        
+        # Still allow binary correctness as additional signal, but weight by confidence
+        correctness_weight = seq_is_correct.float()
+        confidence_weight = confidence
+        
+        # Combined target: prefer halting when both correct and confident
+        # But also allow halting when very confident (model is sure, even if wrong initially)
+        q_halt_targets = torch.where(
+            correctness_weight > 0.5,  # If correct
+            torch.ones_like(q_halt_targets),  # Definitely halt
+            q_halt_targets  # Otherwise use confidence-based halting
         )
+        
+        q_halt_loss_per_seq = F.binary_cross_entropy_with_logits(
+            outputs["q_halt_logits"], 
+            q_halt_targets, 
+            reduction="none"
+        )  # [batch]
+        
+        # Weight by confidence: more confident predictions should have stronger halting signal
+        confidence_weights = 0.5 + 0.5 * confidence  # Between 0.5 and 1.0
+        q_halt_loss = (q_halt_loss_per_seq * confidence_weights).sum() / max(batch_size, 1)
+        
+        # Track confidence in metrics
+        metrics["avg_confidence"] = confidence.mean().detach()
         
         # 3. Carry loss (auxiliary) - only if carries are provided
         carry_loss = torch.tensor(0.0, device=lm_loss.device)
@@ -175,23 +234,43 @@ class ACTLossHeadLilavati(nn.Module):
             carry_logits = outputs["carry_logits"]  # [batch, num_stambha]
             carries_float = carries.to(carry_logits.dtype)
             
-            # Only compute loss for valid carry positions
+            # Pad or truncate carries to match num_stambha
             num_stambha = carry_logits.shape[1]
-            carries_truncated = carries_float[:, :num_stambha]
+            carry_len = carries_float.shape[1] if carries_float.ndim > 1 else 1
             
-            carry_loss = F.binary_cross_entropy_with_logits(
+            if carry_len < num_stambha:
+                # Pad with zeros
+                padding = torch.zeros(
+                    carries_float.shape[0], 
+                    num_stambha - carry_len, 
+                    dtype=carries_float.dtype, 
+                    device=carries_float.device
+                )
+                carries_padded = torch.cat([carries_float, padding], dim=1)
+            elif carry_len > num_stambha:
+                # Truncate
+                carries_padded = carries_float[:, :num_stambha]
+            else:
+                carries_padded = carries_float
+            
+            # Normalize by number of valid carry positions (non-negative)
+            carry_loss_per_pos = F.binary_cross_entropy_with_logits(
                 carry_logits, 
-                carries_truncated, 
-                reduction="sum"
-            )
+                carries_padded, 
+                reduction="none"
+            )  # [batch, num_stambha]
+            # Only count non-negative carries as valid (though carries should be 0 or 1, but be safe)
+            num_valid_carries = (carries_padded >= 0).sum().float().clamp_min(1.0)
+            carry_loss = carry_loss_per_pos.sum() / num_valid_carries
             
             # Carry accuracy metric
             with torch.no_grad():
                 carry_preds = (carry_logits > 0).float()
-                carry_correct = (carry_preds == carries_truncated).float().mean()
+                carry_correct = (carry_preds == carries_padded).float().mean()
                 metrics["carry_accuracy"] = carry_correct * valid_metrics.sum()
         
         # 4. Digit loss (per-stambha supervision)
+        # CRITICAL: This is the most important auxiliary loss - it directly supervises answer digits
         digit_loss = torch.tensor(0.0, device=lm_loss.device)
         if "digit_logits" in outputs:
             digit_logits = outputs["digit_logits"]  # [batch, num_stambha, 10]
@@ -208,11 +287,12 @@ class ACTLossHeadLilavati(nn.Module):
                 valid_logits = digit_logits[valid_digits]  # [num_valid, 10]
                 valid_targets = digit_targets[valid_digits]  # [num_valid]
                 
+                # Normalize by number of valid digits
                 digit_loss = F.cross_entropy(
                     valid_logits,
                     valid_targets,
                     reduction="sum"
-                )
+                ) / valid_digits.sum().float().clamp_min(1.0)
                 
                 # Digit accuracy metric
                 with torch.no_grad():
@@ -239,12 +319,30 @@ class ACTLossHeadLilavati(nn.Module):
             )
             metrics["q_continue_loss"] = q_continue_loss.detach()
         
-        # Total loss
+        # Step-based regularization: ACT-style ponder cost
+        # Encourage early halting when confident (standard ACT formulation)
+        # Penalty: small cost per step to encourage efficiency
+        ponder_cost = torch.tensor(0.0, device=lm_loss.device)
+        if batch_size > 0:
+            # Average steps across all sequences (not just halted)
+            avg_steps = new_carry.steps.float().mean()
+            # Small cost per step (standard ACT: encourage early halting)
+            ponder_cost_per_step = 0.001  # Small penalty to encourage efficiency
+            ponder_cost = ponder_cost_per_step * avg_steps * batch_size
+            
+            metrics["avg_steps"] = avg_steps.detach()
+            metrics["ponder_cost"] = ponder_cost.detach()
+        
+        # Total loss with increased auxiliary supervision
+        # CRITICAL: Increased weights force the model to learn proper reasoning, not shortcuts
+        # Digit loss is most critical - it directly supervises the answer digits
+        # Q-halt loss uses confidence-based signal (not binary correctness)
         total_loss = (
             lm_loss + 
             0.5 * (q_halt_loss + q_continue_loss) + 
             self.carry_loss_weight * carry_loss +
-            self.digit_loss_weight * digit_loss
+            self.digit_loss_weight * digit_loss +
+            ponder_cost  # Ponder cost instead of step penalty
         )
         
         # Filter outputs for return

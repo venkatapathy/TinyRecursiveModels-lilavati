@@ -2,8 +2,8 @@ name: recursive_reasoning.trm_lilavati@TRM_Lilavati
 loss:
   name: losses_lilavati@ACTLossHeadLilavati
   loss_type: stablemax_cross_entropy
-  carry_loss_weight: 0.1
-  digit_loss_weight: 0.1
+  carry_loss_weight: 0.5  # Increased from 0.1 to force proper carry reasoning
+  digit_loss_weight: 0.5  # Increased from 0.1 to force proper digit-by-digit reasoning
 
 # SthanaYantra config optimized for 5-digit (result up to 6 digits)
 num_stambha: 8        # 6 digits + 2 margin (स्तम्भ)

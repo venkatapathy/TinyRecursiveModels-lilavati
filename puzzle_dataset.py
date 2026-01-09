@@ -138,10 +138,17 @@ class PuzzleDataset(IterableDataset):
                     set_name_ = set_name + str(i)
                 else:
                     set_name_ = set_name
-                self._data[set_name_] = {
-                    field_name: np.load(os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
-                    for field_name, mmap_mode in field_mmap_modes.items()
-                }
+                dataset_dict = {}
+                # Load required fields
+                for field_name, mmap_mode in field_mmap_modes.items():
+                    file_path = os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy")
+                    if os.path.exists(file_path):
+                        dataset_dict[field_name] = np.load(file_path, mmap_mode=mmap_mode)
+                # Optionally load carries field if it exists (for Lilavati dataset)
+                carries_path = os.path.join(dataset_path, self.split, f"{set_name}__carries.npy")
+                if os.path.exists(carries_path):
+                    dataset_dict["carries"] = np.load(carries_path, mmap_mode="r")
+                self._data[set_name_] = dataset_dict
 
 
     def _collate_batch(self, batch):
@@ -158,9 +165,18 @@ class PuzzleDataset(IterableDataset):
             pad_values = {
                 "inputs": self.metadata.pad_id,
                 "labels": IGNORE_LABEL_ID,
-                "puzzle_identifiers": self.metadata.blank_identifier_id
+                "puzzle_identifiers": self.metadata.blank_identifier_id,
+                "carries": 0  # Pad carries with 0 (no carry)
             }
-            batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
+            # Pad only keys that are in pad_values, handle others separately
+            padded_batch = {}
+            for k, v in batch.items():
+                if k in pad_values:
+                    padded_batch[k] = np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k])
+                else:
+                    # For other fields, pad with zeros
+                    padded_batch[k] = np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=0)
+            batch = padded_batch
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
@@ -187,11 +203,15 @@ class PuzzleDataset(IterableDataset):
 
                     puzzle_indices.append(puzzle_index)
                 
-                batch = self._collate_batch({
+                batch_dict = {
                     "inputs": dataset["inputs"][local_start: local_end],
                     "labels": dataset["labels"][local_start: local_end],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                })
+                }
+                # Include carries if available
+                if "carries" in dataset:
+                    batch_dict["carries"] = dataset["carries"][local_start: local_end]
+                batch = self._collate_batch(batch_dict)
 
                 yield set_name, batch, end_index - start_index
                 
@@ -228,11 +248,15 @@ class PuzzleDataset(IterableDataset):
 
                 batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
                 batch_puzzle_indices = batch_puzzle_indices[self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch = self._collate_batch({
+                batch_dict = {
                     "inputs": dataset["inputs"][batch_indices],
                     "labels": dataset["labels"][batch_indices],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
-                })
+                }
+                # Include carries if available
+                if "carries" in dataset:
+                    batch_dict["carries"] = dataset["carries"][batch_indices]
+                batch = self._collate_batch(batch_dict)
 
                 yield set_name, batch, global_effective_batch_size
                 

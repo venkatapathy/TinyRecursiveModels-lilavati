@@ -26,12 +26,12 @@ class AdditionEvaluator:
         self.vocab_map_inv[0] = 'PAD'
         self.vocab_map_inv[1] = 'MASK'
         
-        assert dataset_mode in {"vanilla", "lilavati1", "lilavati2"}, f"dataset_mode must be 'vanilla', 'lilavati1', or 'lilavati2', got {dataset_mode}"
+        assert dataset_mode in {"vanilla", "lilavati1", "lilavati2", "lilavati3"}, f"dataset_mode must be 'vanilla', 'lilavati1', 'lilavati2', or 'lilavati3', got {dataset_mode}"
         self.dataset_mode = dataset_mode
         self.digits = digits
         
         # Validate dataset mode matches vocabulary
-        if dataset_mode in {"lilavati1", "lilavati2"}:
+        if dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
             assert eval_metadata.vocab_size >= 15, f"Lilavati mode requires vocab_size >= 15 (to include <CAR> token), got {eval_metadata.vocab_size}"
         else:
             # Vanilla mode should not have <CAR> token, but we allow vocab_size >= 15 for compatibility
@@ -144,7 +144,7 @@ class AdditionEvaluator:
                     if pred_res == expected_res:
                         self.sequence_correct += 1
                 
-                else:  # lilavati1 or lilavati2
+                else:  # lilavati1, lilavati2, or lilavati3
                     # Result is max_result_digits after '=', then <CAR>, then carries
                     max_result_digits = self.digits + 1
                     result_start = eq_idx + 1
@@ -210,7 +210,7 @@ class AdditionEvaluator:
     def result(self, save_path: Optional[str], rank: int, world_size: int, group=None):
         # Aggregate metrics
         if world_size > 1:
-            if self.dataset_mode in {"lilavati1", "lilavati2"}:
+            if self.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
                 t = torch.tensor([self.total, self.digit_correct, self.sequence_correct, self.carry_correct, self.carry_total], device="cuda", dtype=torch.long)
             else:
                 t = torch.tensor([self.total, self.digit_correct, self.sequence_correct, 0, 0], device="cuda", dtype=torch.long)
@@ -243,7 +243,7 @@ class AdditionEvaluator:
                 "val/sequence_accuracy": seq_acc,
             }
             
-            if self.dataset_mode in {"lilavati1", "lilavati2"}:
+            if self.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
                 carry_acc = carry_corr / carry_tot if carry_tot > 0 else 0.0
                 metrics["val/carry_accuracy"] = carry_acc
                 print(f"Addition Eval ({self.dataset_mode}): digit_acc={digit_acc:.4f}, carry_acc={carry_acc:.4f}, seq_acc={seq_acc:.4f} ({seq_corr}/{total})")

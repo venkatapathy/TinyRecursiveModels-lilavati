@@ -17,6 +17,7 @@ IGNORE_LABEL_ID = -100
 class TinyRecursiveReasoningModel_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
+    z_C: Optional[torch.Tensor] = None  # Lilavati3: separate carry latent
 
 
 @dataclass
@@ -62,8 +63,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
-    # Lilavati2: separate carry head
-    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", or "lilavati2"
+    # Lilavati2/lilavati3: separate carry head
+    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", "lilavati2", or "lilavati3"
     digits: int = 3
     carry_loss_weight: float = 1.0
 
@@ -135,8 +136,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
         
-        # Lilavati2: separate carry head (same architecture as lm_head)
-        if self.config.dataset_mode == "lilavati2":
+        # Lilavati2/lilavati3: separate carry head (same architecture as lm_head)
+        if self.config.dataset_mode in {"lilavati2", "lilavati3"}:
             self.carry_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
@@ -157,10 +158,18 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Reasoning Layers
         self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        
+        # Lilavati3: separate reasoning path for carry
+        if self.config.dataset_mode == "lilavati3":
+            self.C_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        
+        # Lilavati3: separate initial state for carry
+        if self.config.dataset_mode == "lilavati3":
+            self.C_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -191,15 +200,26 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        z_C = None
+        if self.config.dataset_mode == "lilavati3":
+            z_C = torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype)
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_C=z_C,
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
+        z_C = None
+        if self.config.dataset_mode == "lilavati3":
+            if carry.z_C is not None:
+                z_C = torch.where(reset_flag.view(-1, 1, 1), self.C_init, carry.z_C)
+            else:
+                z_C = self.C_init.expand(carry.z_H.shape[0], -1, -1)
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            z_C=z_C,
         )
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
@@ -213,26 +233,40 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Forward iterations
         it = 0
         z_H, z_L = carry.z_H, carry.z_L
+        z_C = carry.z_C if carry.z_C is not None else None
+        
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
+                
+                # Lilavati3: process z_C in parallel with z_H
+                if self.config.dataset_mode == "lilavati3" and z_C is not None:
+                    z_C = self.C_level(z_C, z_H + input_embeddings, **seq_info)
+        
         # 1 with grad
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
+        
+        # Lilavati3: final z_C update with grad
+        if self.config.dataset_mode == "lilavati3" and z_C is not None:
+            z_C = self.C_level(z_C, z_H + input_embeddings, **seq_info)
 
         # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_z_C = z_C.detach() if z_C is not None else None
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach(), z_C=new_z_C)  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         
-        # Lilavati2: separate carry logits
+        # Lilavati2/lilavati3: separate carry logits
         carry_logits = None
-        if self.config.dataset_mode == "lilavati2":
-            carry_logits = self.carry_head(z_H)[:, self.puzzle_emb_len:]
+        if self.config.dataset_mode in {"lilavati2", "lilavati3"}:
+            # Lilavati2: use z_H, Lilavati3: use z_C
+            carry_source = z_C if self.config.dataset_mode == "lilavati3" and z_C is not None else z_H
+            carry_logits = self.carry_head(carry_source)[:, self.puzzle_emb_len:]
         
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), carry_logits
 

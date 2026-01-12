@@ -83,6 +83,9 @@ class DigitWiseEvaluator:
         self.total_carry_correct = 0
         self.total_carry_count = 0
         
+        # Track results by digit length (for generalization analysis)
+        self.results_by_length = defaultdict(lambda: {'total': 0, 'correct': 0, 'digit_correct': 0, 'digit_total': 0})
+        
         # Examples for debugging
         self.examples = []
     
@@ -168,9 +171,15 @@ class DigitWiseEvaluator:
                 
                 self.valid += 1
                 
+                # Determine result length (for generalization analysis)
+                result_length = len(str(expected_result))
+                
                 # Format strings for digit comparison (zero-padded)
                 expected_str = f"{expected_result:0{self.max_result_digits}d}"
                 pred_str = f"{pred_result:0{self.max_result_digits}d}"
+                
+                # Track by result length
+                self.results_by_length[result_length]['total'] += 1
                 
                 # Digit-wise accuracy (position 0 = MSB)
                 all_digits_correct = True
@@ -178,9 +187,11 @@ class DigitWiseEvaluator:
                     if pos < len(expected_str) and pos < len(pred_str):
                         self.digit_total[pos] += 1
                         self.total_digit_count += 1
+                        self.results_by_length[result_length]['digit_total'] += 1
                         if expected_str[pos] == pred_str[pos]:
                             self.digit_correct[pos] += 1
                             self.total_digit_correct += 1
+                            self.results_by_length[result_length]['digit_correct'] += 1
                         else:
                             all_digits_correct = False
                     else:
@@ -189,6 +200,7 @@ class DigitWiseEvaluator:
                 # Sequence accuracy
                 if pred_result == expected_result:
                     self.sequence_correct += 1
+                    self.results_by_length[result_length]['correct'] += 1
                 
                 # Handle carries for lilavati modes
                 if self.dataset_mode in {"lilavati1", "lilavati2"} and self.car_token_id is not None:
@@ -260,6 +272,17 @@ class DigitWiseEvaluator:
                     acc = self.carry_correct[pos] / self.carry_total[pos]
                     carry_acc_by_pos[f'pos_{pos}'] = acc
             results['carry_accuracy_by_position'] = carry_acc_by_pos
+        
+        # Results by length (for generalization analysis)
+        results_by_length = {}
+        for length, stats in sorted(self.results_by_length.items()):
+            if stats['total'] > 0:
+                results_by_length[length] = {
+                    'count': stats['total'],
+                    'sequence_accuracy': stats['correct'] / stats['total'],
+                    'digit_accuracy': stats['digit_correct'] / stats['digit_total'] if stats['digit_total'] > 0 else 0.0,
+                }
+        results['results_by_length'] = results_by_length
         
         return results
 
@@ -507,7 +530,7 @@ def init_wandb_for_eval(checkpoint_path: str, dataset_path: str, dataset_mode: s
     return wandb.run
 
 
-def log_results_to_wandb(results: Dict, checkpoint_path: str = None):
+def log_results_to_wandb(results: Dict, checkpoint_path: str = None, digits: int = 6):
     """Log evaluation results to wandb with 'eval/' prefix."""
     if not WANDB_AVAILABLE:
         return
@@ -527,8 +550,22 @@ def log_results_to_wandb(results: Dict, checkpoint_path: str = None):
         "eval/valid_examples": results['valid_examples'],
     }
     
-    # Add per-position digit accuracy
-    for pos, acc in results['digit_accuracy_by_position'].items():
+    # Explicitly log all 6 main digit positions (0-5) and overflow (6) separately
+    digit_acc_by_pos = results['digit_accuracy_by_position']
+    for pos_num in range(digits):  # Main 6 digits (0-5)
+        pos_key = f'pos_{pos_num}'
+        if pos_key in digit_acc_by_pos:
+            metrics[f"eval/digit_acc_d{pos_num}"] = digit_acc_by_pos[pos_key]
+        else:
+            metrics[f"eval/digit_acc_d{pos_num}"] = 0.0  # Log 0 if missing
+    
+    # Overflow digit (position 6) if exists
+    overflow_key = f'pos_{digits}'
+    if overflow_key in digit_acc_by_pos:
+        metrics[f"eval/digit_acc_overflow"] = digit_acc_by_pos[overflow_key]
+    
+    # Also log all positions as before for backward compatibility
+    for pos, acc in digit_acc_by_pos.items():
         pos_num = int(pos.split('_')[1])
         metrics[f"eval/digit_acc_pos_{pos_num}"] = acc
     
@@ -538,6 +575,34 @@ def log_results_to_wandb(results: Dict, checkpoint_path: str = None):
         for pos, acc in results['carry_accuracy_by_position'].items():
             pos_num = int(pos.split('_')[1])
             metrics[f"eval/carry_acc_pos_{pos_num}"] = acc
+            # Also log with explicit digit naming for main 6 positions
+            if pos_num < digits:
+                metrics[f"eval/carry_acc_d{pos_num}"] = acc
+    
+    # Log results by length (generalization metrics)
+    if 'results_by_length' in results:
+        ood_seq_acc = []
+        ood_digit_acc = []
+        for length, stats in results['results_by_length'].items():
+            metrics[f"eval/seq_acc_{length}digit"] = stats['sequence_accuracy']
+            metrics[f"eval/digit_acc_{length}digit"] = stats['digit_accuracy']
+            metrics[f"eval/count_{length}digit"] = stats['count']
+            # Collect OOD (out-of-distribution) results
+            if length > 5:  # 6-digit and 7-digit results not in training
+                ood_seq_acc.append(stats['sequence_accuracy'])
+                ood_digit_acc.append(stats['digit_accuracy'])
+        
+        # Log weighted average for OOD results
+        if ood_seq_acc:
+            # Calculate weighted average based on counts
+            total_ood = sum(results['results_by_length'][l]['count'] for l in results['results_by_length'].keys() if l > 5)
+            weighted_seq_acc = sum(results['results_by_length'][l]['sequence_accuracy'] * results['results_by_length'][l]['count'] 
+                                  for l in results['results_by_length'].keys() if l > 5) / total_ood if total_ood > 0 else 0
+            weighted_digit_acc = sum(results['results_by_length'][l]['digit_accuracy'] * results['results_by_length'][l]['count'] 
+                                    for l in results['results_by_length'].keys() if l > 5) / total_ood if total_ood > 0 else 0
+            metrics[f"eval/seq_acc_ood"] = weighted_seq_acc
+            metrics[f"eval/digit_acc_ood"] = weighted_digit_acc
+            metrics[f"eval/count_ood"] = total_ood
     
     # Log checkpoint info if available
     if checkpoint_path:
@@ -546,11 +611,64 @@ def log_results_to_wandb(results: Dict, checkpoint_path: str = None):
     # Log all metrics
     wandb.log(metrics)
     
-    # Create summary table for digit accuracy by position
+    # Create bar chart for digit accuracy comparison
+    # Wandb will automatically create bar charts from tables with proper structure
+    digit_chart_data = []
+    for pos_num in range(digits):  # Main 6 digits
+        pos_key = f'pos_{pos_num}'
+        label = f"Digit {pos_num}" if pos_num > 0 else f"Digit {pos_num} (MSD)"
+        if pos_key in digit_acc_by_pos:
+            acc = digit_acc_by_pos[pos_key]
+            digit_chart_data.append([label, acc])
+        else:
+            digit_chart_data.append([label, 0.0])
+    
+    if digit_chart_data:
+        # Create table for bar chart visualization
+        digit_bar_table = wandb.Table(
+            columns=["Digit", "Accuracy"],
+            data=digit_chart_data
+        )
+        wandb.log({
+            "eval/digit_accuracy_bar": wandb.plot.bar(
+                digit_bar_table,
+                "Digit",
+                "Accuracy",
+                title="Digit-wise Accuracy Comparison (Bar Chart)"
+            )
+        })
+    
+    # Also create a comprehensive comparison table
+    digit_comparison_data = []
+    for pos_num in range(digits):  # Main 6 digits
+        pos_key = f'pos_{pos_num}'
+        if pos_key in digit_acc_by_pos:
+            acc = digit_acc_by_pos[pos_key]
+            digit_comparison_data.append([
+                f"Digit {pos_num} (MSD→LSD)" if pos_num == 0 else f"Digit {pos_num}",
+                f"{acc:.4f}",
+                f"{acc*100:.2f}%"
+            ])
+        else:
+            digit_comparison_data.append([
+                f"Digit {pos_num}",
+                "0.0000",
+                "0.00%"
+            ])
+    
+    if digit_comparison_data:
+        digit_comparison_table = wandb.Table(
+            columns=["Digit Position", "Accuracy", "Percentage"],
+            data=digit_comparison_data
+        )
+        wandb.log({"eval/digit_comparison_table": digit_comparison_table})
+    
+    # Create summary table for all digit positions (including overflow)
     digit_table_data = []
     for pos, acc in sorted(results['digit_accuracy_by_position'].items()):
         pos_num = int(pos.split('_')[1])
-        digit_table_data.append([f"Position {pos_num}", f"{acc:.4f}", f"{acc*100:.2f}%"])
+        label = f"Digit {pos_num}" if pos_num < digits else f"Overflow (pos {pos_num})"
+        digit_table_data.append([label, f"{acc:.4f}", f"{acc*100:.2f}%"])
     
     if digit_table_data:
         digit_table = wandb.Table(
@@ -564,7 +682,7 @@ def log_results_to_wandb(results: Dict, checkpoint_path: str = None):
         carry_table_data = []
         for pos, acc in sorted(results['carry_accuracy_by_position'].items()):
             pos_num = int(pos.split('_')[1])
-            carry_table_data.append([f"Position {pos_num}", f"{acc:.4f}", f"{acc*100:.2f}%"])
+            carry_table_data.append([f"Carry Position {pos_num} (LSB→MSB)", f"{acc:.4f}", f"{acc*100:.2f}%"])
         
         if carry_table_data:
             carry_table = wandb.Table(
@@ -594,10 +712,25 @@ def print_results(results: Dict, examples: list = None, verbose: bool = False):
     
     print(f"\nOverall Digit Accuracy: {results['overall_digit_accuracy']:.4f} ({results['overall_digit_accuracy']*100:.2f}%)")
     
-    print(f"\nDigit Accuracy by Position (position 0 = MSD):")
-    for pos, acc in sorted(results['digit_accuracy_by_position'].items()):
-        pos_num = int(pos.split('_')[1])
-        print(f"  Position {pos_num}: {acc:.4f} ({acc*100:.2f}%)")
+    # Show all 6 main digits explicitly
+    print(f"\nDigit Accuracy by Position (6 main digits + overflow):")
+    digit_acc_by_pos = results['digit_accuracy_by_position']
+    for pos_num in sorted([int(p.split('_')[1]) for p in digit_acc_by_pos.keys()]):
+        pos_key = f'pos_{pos_num}'
+        if pos_key in digit_acc_by_pos:
+            acc = digit_acc_by_pos[pos_key]
+            label = f"Digit {pos_num} (MSD)" if pos_num == 0 else f"Digit {pos_num}" if pos_num < 6 else f"Overflow (pos {pos_num})"
+            print(f"  {label:20s}: {acc:.4f} ({acc*100:.2f}%)")
+    
+    # Also show comparison of all 6 main digits
+    print(f"\nComparison of 6 Main Digits (0-5):")
+    for pos_num in range(6):
+        pos_key = f'pos_{pos_num}'
+        if pos_key in digit_acc_by_pos:
+            acc = digit_acc_by_pos[pos_key]
+            print(f"  Digit {pos_num}: {acc:.4f} ({acc*100:.2f}%)")
+        else:
+            print(f"  Digit {pos_num}: N/A")
     
     if 'overall_carry_accuracy' in results:
         print(f"\nOverall Carry Accuracy: {results['overall_carry_accuracy']:.4f} ({results['overall_carry_accuracy']*100:.2f}%)")
@@ -606,6 +739,18 @@ def print_results(results: Dict, examples: list = None, verbose: bool = False):
         for pos, acc in sorted(results['carry_accuracy_by_position'].items()):
             pos_num = int(pos.split('_')[1])
             print(f"  Position {pos_num}: {acc:.4f} ({acc*100:.2f}%)")
+    
+    # Show results by length (generalization analysis)
+    if 'results_by_length' in results and results['results_by_length']:
+        print(f"\n{'='*40}")
+        print("GENERALIZATION ANALYSIS (by result length)")
+        print(f"{'='*40}")
+        print(f"\n{'Length':<10} {'Count':<10} {'Seq Acc':<12} {'Digit Acc':<12} {'In Training?'}")
+        print("-" * 60)
+        for length in sorted(results['results_by_length'].keys()):
+            stats = results['results_by_length'][length]
+            in_training = "Yes" if length <= 5 else "No (OOD)"
+            print(f"{length} digits  {stats['count']:<10} {stats['sequence_accuracy']:.4f} ({stats['sequence_accuracy']*100:.1f}%)  {stats['digit_accuracy']:.4f} ({stats['digit_accuracy']*100:.1f}%)  {in_training}")
     
     print("\n" + "=" * 70)
     
@@ -713,7 +858,7 @@ Examples:
     if args.wandb and WANDB_AVAILABLE:
         try:
             if wandb.run is not None:
-                log_results_to_wandb(results, checkpoint_path=args.checkpoint)
+                log_results_to_wandb(results, checkpoint_path=args.checkpoint, digits=digits)
                 wandb.finish()
         except:
             pass

@@ -5,7 +5,7 @@ defaults:
 hydra:
   output_subdir: null
 
-# Data path
+# Data path (lilavati3 uses same data format as lilavati1/lilavati2)
 data_paths: ['data/addition6_lilavati1_strict_mixed_fixed']
 data_paths_test: ['data/addition6_lilavati1_strict_mixed_fixed']
 
@@ -13,7 +13,7 @@ evaluators:
   - name: addition@AdditionEvaluator
 
 # Dataset mode
-dataset_mode: "lilavati1"
+dataset_mode: "lilavati3"
 digits: 6
 
 # Hyperparams - Training
@@ -26,7 +26,7 @@ checkpoint_every_eval: False
 lr: 1e-4
 lr_min_ratio: 0.01
 lr_warmup_steps: 100
-grad_clip: 0.0
+grad_clip: 1.0
 
 beta1: 0.9
 beta2: 0.95
@@ -40,4 +40,8 @@ seed: 42
 min_eval_interval: 0
 
 project_name: "trm-lilavati"
-run_name: "lilavati1_trm_d6"
+run_name: "lilavati3_trm_d6"
+
+# Lilavati3 specific: carry loss weight (can be tuned)
+arch:
+  carry_loss_weight: 1.0

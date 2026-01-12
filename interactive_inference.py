@@ -172,13 +172,13 @@ def encode_input(input_str: str, dataset_mode: str, digits: int, seq_len: int, v
             raise ValueError(f"Invalid character '{c}' in input. Only digits, '+', and '=' are allowed.")
     
     # Determine how many mask tokens we need
-    # Format: "XXX+YYY=MMMM" for vanilla or "XXX+YYY=MMMM <CAR> MMM" for lilavati1/lilavati2
+    # Format: "XXX+YYY=MMMM" for vanilla or "XXX+YYY=MMMM <CAR> MMM" for lilavati modes
     max_result_digits = digits + 1
     
     if dataset_mode == "vanilla":
         # Add mask tokens for result
         encoded.extend([MASK_ID] * max_result_digits)
-    else:  # lilavati1 or lilavati2
+    else:  # lilavati1, lilavati2, or lilavati3
         # Add mask tokens for result, then <CAR>, then mask tokens for carries
         encoded.extend([MASK_ID] * max_result_digits)
         if CAR_TOKEN_ID is not None:
@@ -327,7 +327,7 @@ def main():
                 output_after_eq = output[eq_pos+1:]
                 # Remove mask tokens and other non-digit characters for cleaner display
                 result_clean = ''.join(c for c in output_after_eq if c.isdigit())
-                if dataset_mode in {"lilavati1", "lilavati2"} and '<CAR>' in output_after_eq:
+                if dataset_mode in {"lilavati1", "lilavati2", "lilavati3"} and '<CAR>' in output_after_eq:
                     # Extract carries too
                     car_pos = output_after_eq.find('<CAR>')
                     if car_pos >= 0:

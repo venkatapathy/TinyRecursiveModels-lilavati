@@ -5,7 +5,7 @@ from typing import Optional
 from argdantic import ArgParser
 from pydantic import BaseModel
 from dataset.common import PuzzleDatasetMetadata
-from collections import Counter
+from collections import Counter, defaultdict
 
 cli = ArgParser()
 
@@ -14,7 +14,7 @@ class DataProcessConfig(BaseModel):
     seed: int = 42
     test_ratio: float = 0.1
     digits: int = 3  # Maximum number of digits for addition (e.g., 3 for up to 999, 4 for up to 9999)
-    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", or "lilavati2"
+    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", "lilavati2", or "lilavati3"
     max_examples: Optional[int] = None  # Maximum total examples. If None, uses all combinations or sample_ratio. If set, randomly samples this many pairs.
     sample_ratio: Optional[float] = None  # Fraction of total combinations to sample (0.0 to 1.0). If None and max_examples is None, uses all combinations.
     varied_length: bool = False  # If True, allows numbers with different lengths (e.g., 2-digit + 3-digit). If False, all numbers are padded to 'digits' length.
@@ -25,7 +25,7 @@ class DataProcessConfig(BaseModel):
 
 @cli.command(singleton=True)
 def main(config: DataProcessConfig):
-    assert config.dataset_mode in {"vanilla", "lilavati1", "lilavati2"}, f"dataset_mode must be 'vanilla', 'lilavati1', or 'lilavati2', got {config.dataset_mode}"
+    assert config.dataset_mode in {"vanilla", "lilavati1", "lilavati2", "lilavati3"}, f"dataset_mode must be 'vanilla', 'lilavati1', 'lilavati2', or 'lilavati3', got {config.dataset_mode}"
     assert config.digits >= 1, f"digits must be >= 1, got {config.digits}"
     assert config.sample_ratio is None or 0.0 < config.sample_ratio <= 1.0, f"sample_ratio must be in (0.0, 1.0], got {config.sample_ratio}"
     assert config.min_carries is None or config.min_carries >= 0, f"min_carries must be >= 0, got {config.min_carries}"
@@ -191,33 +191,42 @@ def main(config: DataProcessConfig):
             raise ValueError(f"No pairs passed the train_max_digits filtering!")
         
         # If target_train_samples is set, use rejection sampling to get enough trainable examples
-        if target_train_samples is not None and len(trainable_pairs) < target_train_samples * 1.2:  # Need extra for 90/10 split
-            print(f"Using batch rejection sampling to reach {target_train_samples:,} trainable examples...")
-            rng = np.random.default_rng(config.seed)
-            trainable_set = set(trainable_pairs)
-            attempts = 0
-            max_rejection_attempts = target_train_samples * 300  # Safety limit
-            batch_size = 100000  # Process in batches
-            
-            while len(trainable_set) < target_train_samples * 1.2 and attempts < max_rejection_attempts:
-                # Generate batch of pairs
-                batch_attempts = min(batch_size, max_rejection_attempts - attempts)
-                a_vals = rng.integers(0, max_val + 1, size=batch_attempts, dtype=np.int32)
-                b_vals = rng.integers(0, max_val + 1, size=batch_attempts, dtype=np.int32)
+        if target_train_samples is not None:
+            target_with_buffer = int(target_train_samples * 1.2)  # Need extra for 90/10 split
+            if len(trainable_pairs) < target_with_buffer:
+                print(f"Using batch rejection sampling to reach {target_train_samples:,} trainable examples (target with buffer: {target_with_buffer:,})...")
+                rng = np.random.default_rng(config.seed)
+                trainable_set = set(trainable_pairs)
+                attempts = 0
+                max_rejection_attempts = target_train_samples * 1000  # Increased safety limit
+                batch_size = 100000  # Process in batches
                 
-                # Filter batch
-                for a, b in zip(a_vals, b_vals):
-                    attempts += 1
-                    # Check if pair passes all filters AND is trainable
-                    if filter_by_carries(a, b, config.digits, config.min_carries, config.min_carry_ratio):
-                        if filter_by_digit_length(a, b, config.train_max_digits):
-                            trainable_set.add((a, b))
+                # Calculate max value for trainable pairs (numbers with ≤train_max_digits)
+                trainable_max_val = 10 ** config.train_max_digits - 1
                 
-                if attempts % 1000000 == 0:
-                    print(f"  Batch rejection sampling: {len(trainable_set):,} trainable pairs after {attempts:,} attempts...")
-            
-            trainable_pairs = list(trainable_set)
-            print(f"Rejection sampling complete: {len(trainable_pairs):,} trainable pairs")
+                while len(trainable_set) < target_with_buffer and attempts < max_rejection_attempts:
+                    # Generate batch of pairs (only from trainable range for efficiency)
+                    batch_attempts = min(batch_size, max_rejection_attempts - attempts)
+                    a_vals = rng.integers(0, trainable_max_val + 1, size=batch_attempts, dtype=np.int32)
+                    b_vals = rng.integers(0, trainable_max_val + 1, size=batch_attempts, dtype=np.int32)
+                    
+                    # Filter batch
+                    for a, b in zip(a_vals, b_vals):
+                        attempts += 1
+                        # Check if pair passes all filters AND is trainable
+                        if filter_by_carries(a, b, config.digits, config.min_carries, config.min_carry_ratio):
+                            if filter_by_digit_length(a, b, config.train_max_digits):
+                                trainable_set.add((a, b))
+                                if len(trainable_set) >= target_with_buffer:
+                                    break
+                    
+                    if attempts % 1000000 == 0:
+                        print(f"  Batch rejection sampling: {len(trainable_set):,} trainable pairs after {attempts:,} attempts...")
+                
+                trainable_pairs = list(trainable_set)
+                print(f"Rejection sampling complete: {len(trainable_pairs):,} trainable pairs")
+                if len(trainable_pairs) < target_train_samples:
+                    print(f"Warning: Only got {len(trainable_pairs):,} trainable pairs, less than target {target_train_samples:,}")
         
         # Split trainable pairs 90/10
         np.random.shuffle(trainable_pairs)
@@ -229,15 +238,36 @@ def main(config: DataProcessConfig):
         train_pairs = trainable_pairs[:split_idx]
         test_pairs = trainable_pairs[split_idx:]
         
-        # Sample ~1% of extra pairs to add to test (to keep overall ratio ~90/10)
+        # Sample OOD pairs to add to test, ensuring equal distribution across all OOD digit lengths
         if len(extra_pairs) > 0:
-            np.random.shuffle(extra_pairs)
-            sample_size = max(1, int(len(train_pairs) * config.test_ratio * 0.1))  # ~1% of train set
-            sample_size = min(sample_size, len(extra_pairs))
-            sampled_extra = extra_pairs[:sample_size]
-            test_pairs.extend(sampled_extra)
-            print(f"Split trainable pairs: {len(train_pairs):,} train, {len(test_pairs) - len(sampled_extra):,} test")
-            print(f"Added {len(sampled_extra):,} sampled extra pairs (>{config.train_max_digits} digits) to test (final test size: {len(test_pairs):,})")
+            # Group extra pairs by their max digit length
+            extra_by_digits = defaultdict(list)
+            for p in extra_pairs:
+                max_digits = max(len(str(p[0])), len(str(p[1])))
+                extra_by_digits[max_digits].append(p)
+            
+            print(f"Extra pairs by digit length: {dict((k, len(v)) for k, v in sorted(extra_by_digits.items()))}")
+            
+            # Calculate how many OOD examples we want in test
+            # Target: approximately equal to the number of in-distribution test examples
+            target_ood_test = len(test_pairs)  # Match the size of in-distribution test set
+            num_ood_digit_lengths = len(extra_by_digits)
+            
+            if num_ood_digit_lengths > 0:
+                # Distribute equally across all OOD digit lengths
+                per_digit_length = max(1, target_ood_test // num_ood_digit_lengths)
+                sampled_extra = []
+                
+                for digit_len in sorted(extra_by_digits.keys()):
+                    pairs_for_length = extra_by_digits[digit_len]
+                    np.random.shuffle(pairs_for_length)
+                    sample_count = min(per_digit_length, len(pairs_for_length))
+                    sampled_extra.extend(pairs_for_length[:sample_count])
+                    print(f"  Sampled {sample_count:,} pairs with {digit_len} digits for OOD test")
+                
+                test_pairs.extend(sampled_extra)
+                print(f"Split trainable pairs: {len(train_pairs):,} train, {len(test_pairs) - len(sampled_extra):,} in-distribution test")
+                print(f"Added {len(sampled_extra):,} OOD pairs (>{config.train_max_digits} digits) to test (final test size: {len(test_pairs):,})")
     else:
         # No train_max_digits filtering - split all pairs normally
         # If target_train_samples is set, use rejection sampling to get enough examples
@@ -291,8 +321,8 @@ def main(config: DataProcessConfig):
     vocab_map['+'] = 12
     vocab_map['='] = 13
     
-    # Add <CAR> token for lilavati1/lilavati2 mode
-    if config.dataset_mode in {"lilavati1", "lilavati2"}:
+    # Add <CAR> token for lilavati modes
+    if config.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
         vocab_map['<CAR>'] = 14
         vocab_size = 15  # 0..14
         CAR_TOKEN_ID = 14
@@ -396,44 +426,50 @@ def main(config: DataProcessConfig):
                 raise ValueError(f"No pairs passed the train_max_digits filtering!")
             
             # If target_train_samples is set, use rejection sampling to get enough trainable examples
-            if target_train_samples is not None and len(trainable_pairs) < target_train_samples * 1.2:
-                print(f"Using batch rejection sampling to reach {target_train_samples:,} trainable examples...")
-                trainable_set = set(trainable_pairs)
-                attempts = 0
-                max_rejection_attempts = target_train_samples * 300
-                batch_size = 100000  # Process in batches
-                
-                while len(trainable_set) < target_train_samples * 1.2 and attempts < max_rejection_attempts:
-                    # Generate batch of pairs
-                    batch_attempts = min(batch_size, max_rejection_attempts - attempts)
-                    # Randomly choose digit lengths for a and b (1 to config.train_max_digits)
-                    a_digits_vals = rng.integers(1, config.train_max_digits + 1, size=batch_attempts)
-                    b_digits_vals = rng.integers(1, config.train_max_digits + 1, size=batch_attempts)
+            if target_train_samples is not None:
+                target_with_buffer = int(target_train_samples * 1.2)  # Need extra for 90/10 split
+                if len(trainable_pairs) < target_with_buffer:
+                    print(f"Using batch rejection sampling to reach {target_train_samples:,} trainable examples (target with buffer: {target_with_buffer:,})...")
+                    trainable_set = set(trainable_pairs)
+                    attempts = 0
+                    max_rejection_attempts = target_train_samples * 1000  # Increased safety limit
+                    batch_size = 100000  # Process in batches
                     
-                    # Generate random numbers with those digit lengths
-                    a_vals = []
-                    b_vals = []
-                    for a_digits, b_digits in zip(a_digits_vals, b_digits_vals):
-                        a_min = 10 ** (a_digits - 1) if a_digits > 1 else 0
-                        a_max = 10 ** a_digits - 1
-                        b_min = 10 ** (b_digits - 1) if b_digits > 1 else 0
-                        b_max = 10 ** b_digits - 1
-                        a_vals.append(rng.integers(a_min, a_max + 1))
-                        b_vals.append(rng.integers(b_min, b_max + 1))
+                    while len(trainable_set) < target_with_buffer and attempts < max_rejection_attempts:
+                        # Generate batch of pairs
+                        batch_attempts = min(batch_size, max_rejection_attempts - attempts)
+                        # Randomly choose digit lengths for a and b (1 to config.train_max_digits)
+                        a_digits_vals = rng.integers(1, config.train_max_digits + 1, size=batch_attempts)
+                        b_digits_vals = rng.integers(1, config.train_max_digits + 1, size=batch_attempts)
+                        
+                        # Generate random numbers with those digit lengths
+                        a_vals = []
+                        b_vals = []
+                        for a_digits, b_digits in zip(a_digits_vals, b_digits_vals):
+                            a_min = 10 ** (a_digits - 1) if a_digits > 1 else 0
+                            a_max = 10 ** a_digits - 1
+                            b_min = 10 ** (b_digits - 1) if b_digits > 1 else 0
+                            b_max = 10 ** b_digits - 1
+                            a_vals.append(rng.integers(a_min, a_max + 1))
+                            b_vals.append(rng.integers(b_min, b_max + 1))
+                        
+                        # Filter batch
+                        for a, b in zip(a_vals, b_vals):
+                            attempts += 1
+                            # Check if pair passes all filters AND is trainable
+                            if filter_by_carries(a, b, config.digits, config.min_carries, config.min_carry_ratio):
+                                if filter_by_digit_length(a, b, config.train_max_digits):
+                                    trainable_set.add((a, b))
+                                    if len(trainable_set) >= target_with_buffer:
+                                        break
+                        
+                        if attempts % 1000000 == 0:
+                            print(f"  Batch rejection sampling: {len(trainable_set):,} trainable pairs after {attempts:,} attempts...")
                     
-                    # Filter batch
-                    for a, b in zip(a_vals, b_vals):
-                        attempts += 1
-                        # Check if pair passes all filters AND is trainable
-                        if filter_by_carries(a, b, config.digits, config.min_carries, config.min_carry_ratio):
-                            if filter_by_digit_length(a, b, config.train_max_digits):
-                                trainable_set.add((a, b))
-                    
-                    if attempts % 1000000 == 0:
-                        print(f"  Batch rejection sampling: {len(trainable_set):,} trainable pairs after {attempts:,} attempts...")
-                
-                trainable_pairs = list(trainable_set)
-                print(f"Rejection sampling complete: {len(trainable_pairs):,} trainable pairs")
+                    trainable_pairs = list(trainable_set)
+                    print(f"Rejection sampling complete: {len(trainable_pairs):,} trainable pairs")
+                    if len(trainable_pairs) < target_train_samples:
+                        print(f"Warning: Only got {len(trainable_pairs):,} trainable pairs, less than target {target_train_samples:,}")
             
             # Split trainable pairs 90/10
             np.random.shuffle(trainable_pairs)
@@ -445,15 +481,36 @@ def main(config: DataProcessConfig):
             train_pairs = trainable_pairs[:split_idx]
             test_pairs = trainable_pairs[split_idx:]
             
-            # Sample ~1% of extra pairs to add to test (to keep overall ratio ~90/10)
+            # Sample OOD pairs to add to test, ensuring equal distribution across all OOD digit lengths
             if len(extra_pairs) > 0:
-                np.random.shuffle(extra_pairs)
-                sample_size = max(1, int(len(train_pairs) * config.test_ratio * 0.1))  # ~1% of train set
-                sample_size = min(sample_size, len(extra_pairs))
-                sampled_extra = extra_pairs[:sample_size]
-                test_pairs.extend(sampled_extra)
-                print(f"Split trainable pairs: {len(train_pairs):,} train, {len(test_pairs) - len(sampled_extra):,} test")
-                print(f"Added {len(sampled_extra):,} sampled extra pairs (>{config.train_max_digits} digits) to test (final test size: {len(test_pairs):,})")
+                # Group extra pairs by their max digit length
+                extra_by_digits = defaultdict(list)
+                for p in extra_pairs:
+                    max_digits = max(len(str(p[0])), len(str(p[1])))
+                    extra_by_digits[max_digits].append(p)
+                
+                print(f"Extra pairs by digit length: {dict((k, len(v)) for k, v in sorted(extra_by_digits.items()))}")
+                
+                # Calculate how many OOD examples we want in test
+                # Target: approximately equal to the number of in-distribution test examples
+                target_ood_test = len(test_pairs)  # Match the size of in-distribution test set
+                num_ood_digit_lengths = len(extra_by_digits)
+                
+                if num_ood_digit_lengths > 0:
+                    # Distribute equally across all OOD digit lengths
+                    per_digit_length = max(1, target_ood_test // num_ood_digit_lengths)
+                    sampled_extra = []
+                    
+                    for digit_len in sorted(extra_by_digits.keys()):
+                        pairs_for_length = extra_by_digits[digit_len]
+                        np.random.shuffle(pairs_for_length)
+                        sample_count = min(per_digit_length, len(pairs_for_length))
+                        sampled_extra.extend(pairs_for_length[:sample_count])
+                        print(f"  Sampled {sample_count:,} pairs with {digit_len} digits for OOD test")
+                    
+                    test_pairs.extend(sampled_extra)
+                    print(f"Split trainable pairs: {len(train_pairs):,} train, {len(test_pairs) - len(sampled_extra):,} in-distribution test")
+                    print(f"Added {len(sampled_extra):,} OOD pairs (>{config.train_max_digits} digits) to test (final test size: {len(test_pairs):,})")
         else:
             # No train_max_digits filtering - split all pairs normally
             # If target_train_samples is set, use rejection sampling to get enough examples

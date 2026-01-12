@@ -55,7 +55,7 @@ class PretrainConfig(pydantic.BaseModel):
     evaluators: List[EvaluatorConfig] = []
     
     # Dataset mode
-    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", or "lilavati2"
+    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", "lilavati2", or "lilavati3"
     digits: int = 3
 
     # Hyperparams
@@ -625,6 +625,8 @@ def launch(hydra_config: DictConfig):
                 run_name = f"lilavati1_trm_d{config.digits}"
             elif config.dataset_mode == "lilavati2":
                 run_name = f"lilavati2_trm_d{config.digits}"
+            elif config.dataset_mode == "lilavati3":
+                run_name = f"lilavati3_trm_d{config.digits}"
             else:
                 run_name = f"{config.dataset_mode}_trm_d{config.digits}"
         
@@ -633,12 +635,15 @@ def launch(hydra_config: DictConfig):
             "model": "TRM",
             "variant": config.dataset_mode,
             "digits": config.digits,
-            "include_carry": config.dataset_mode in {"lilavati1", "lilavati2"},
+            "include_carry": config.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"},
         })
-        if config.dataset_mode in {"lilavati1", "lilavati2"}:
+        if config.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
             wandb_config["carry_token"] = "<CAR>"
         if config.dataset_mode == "lilavati2":
             wandb_config["separate_carry_head"] = True
+        if config.dataset_mode == "lilavati3":
+            wandb_config["separate_carry_head"] = True
+            wandb_config["separate_carry_latent"] = True
         
         wandb.init(project=project_name, name=run_name, config=wandb_config, settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)

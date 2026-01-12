@@ -64,8 +64,8 @@ class ACTLossHead(nn.Module):
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
 
-        # For lilavati2: need to compute masks before predictions
-        if self.dataset_mode == "lilavati2" and "carry_logits" in outputs:
+        # For lilavati2/lilavati3: need to compute masks before predictions
+        if self.dataset_mode in {"lilavati2", "lilavati3"} and "carry_logits" in outputs:
             # Find CAR token positions from INPUTS (not labels, as labels may be dummy during inference)
             inputs = new_carry.current_data["inputs"]
             car_mask_inputs = (inputs == CAR_TOKEN_ID)
@@ -129,8 +129,8 @@ class ACTLossHead(nn.Module):
 
         # Losses
         
-        # For lilavati2: compute separate losses for result and carry positions
-        if self.dataset_mode == "lilavati2" and "carry_logits" in outputs:
+        # For lilavati2/lilavati3: compute separate losses for result and carry positions
+        if self.dataset_mode in {"lilavati2", "lilavati3"} and "carry_logits" in outputs:
             # Result mask: valid positions at or before CAR (including CAR itself, since lm_head predicts it)
             result_mask = mask & (positions <= car_positions)
             # Carry mask: valid positions after CAR

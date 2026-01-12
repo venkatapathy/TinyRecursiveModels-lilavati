@@ -62,6 +62,11 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
+    # Lilavati2: separate carry head
+    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", or "lilavati2"
+    digits: int = 3
+    carry_loss_weight: float = 1.0
+
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -129,6 +134,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        
+        # Lilavati2: separate carry head (same architecture as lm_head)
+        if self.config.dataset_mode == "lilavati2":
+            self.carry_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -193,7 +202,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -219,7 +228,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        
+        # Lilavati2: separate carry logits
+        carry_logits = None
+        if self.config.dataset_mode == "lilavati2":
+            carry_logits = self.carry_head(z_H)[:, self.puzzle_emb_len:]
+        
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), carry_logits
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
@@ -256,13 +271,17 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), carry_logits = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits
         }
+        
+        # Lilavati2: add carry_logits to outputs
+        if carry_logits is not None:
+            outputs["carry_logits"] = carry_logits
 
         with torch.no_grad():
             # Step
@@ -291,7 +310,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     # NOTE: No replay buffer and target networks for computing target Q-value.
                     # As batch_size is large, there're many parallel envs.
                     # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
+                    _, _, (next_q_halt_logits, next_q_continue_logits), _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

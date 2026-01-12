@@ -46,12 +46,12 @@ def inspect_dataset(data_dir: str, num_examples: int = 20):
         for part in parts:
             if part.startswith("d") and part[1:].isdigit():
                 digits = int(part[1:])
-            if part in ["vanilla", "lilavati1"]:
+            if part in ["vanilla", "lilavati1", "lilavati2"]:
                 dataset_mode = part
     
     # Also check if we can infer from vocab_size
     if metadata['vocab_size'] >= 15:
-        dataset_mode = "lilavati1"
+        dataset_mode = "lilavati1"  # Could be lilavati1 or lilavati2, but same format
     elif dataset_mode is None:
         dataset_mode = "vanilla"
     
@@ -144,7 +144,7 @@ def inspect_dataset(data_dir: str, num_examples: int = 20):
             
             # Extract carries from label if lilavati1 mode
             carries = None
-            if dataset_mode == "lilavati1" and digits:
+            if dataset_mode in {"lilavati1", "lilavati2"} and digits:
                 # Find <CAR> token in labels
                 car_token_id = 14
                 car_idx = None
@@ -230,7 +230,7 @@ def inspect_dataset(data_dir: str, num_examples: int = 20):
     
     print("1. Examples with smallest results:")
     for ex in examples_by_result[:5]:
-        if dataset_mode == "lilavati1" and ex['carries']:
+        if dataset_mode in {"lilavati1", "lilavati2"} and ex['carries']:
             carries_str = ''.join(str(c) for c in ex['carries'])
             print(f"   {ex['a']:05d} + {ex['b']:05d} = {ex['result']:06d} <CAR> {carries_str} (carries: {ex['carries']})")
         else:
@@ -238,13 +238,13 @@ def inspect_dataset(data_dir: str, num_examples: int = 20):
     
     print("\n2. Examples with largest results:")
     for ex in examples_by_result[-5:]:
-        if dataset_mode == "lilavati1" and ex['carries']:
+        if dataset_mode in {"lilavati1", "lilavati2"} and ex['carries']:
             carries_str = ''.join(str(c) for c in ex['carries'])
             print(f"   {ex['a']:05d} + {ex['b']:05d} = {ex['result']:06d} <CAR> {carries_str} (carries: {ex['carries']})")
         else:
             print(f"   {ex['a']:05d} + {ex['b']:05d} = {ex['result']:06d}")
     
-    if dataset_mode == "lilavati1" and all_carries_list:
+    if dataset_mode in {"lilavati1", "lilavati2"} and all_carries_list:
         # Examples with interesting carry patterns
         print("\n3. Examples with interesting carry patterns:")
         
@@ -274,7 +274,7 @@ def inspect_dataset(data_dir: str, num_examples: int = 20):
     random_sample = np.random.choice(len(examples), min(5, len(examples)), replace=False)
     for idx in random_sample:
         ex = examples[idx]
-        if dataset_mode == "lilavati1" and ex['carries']:
+        if dataset_mode in {"lilavati1", "lilavati2"} and ex['carries']:
             carries_str = ''.join(str(c) for c in ex['carries'])
             print(f"   {ex['a']:05d} + {ex['b']:05d} = {ex['result']:06d} <CAR> {carries_str}")
         else:

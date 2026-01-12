@@ -14,7 +14,7 @@ class DataProcessConfig(BaseModel):
     seed: int = 42
     test_ratio: float = 0.1
     digits: int = 3  # Maximum number of digits for addition (e.g., 3 for up to 999, 4 for up to 9999)
-    dataset_mode: str = "vanilla"  # "vanilla" or "lilavati1"
+    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", or "lilavati2"
     max_examples: Optional[int] = None  # Maximum total examples. If None, uses all combinations or sample_ratio. If set, randomly samples this many pairs.
     sample_ratio: Optional[float] = None  # Fraction of total combinations to sample (0.0 to 1.0). If None and max_examples is None, uses all combinations.
     varied_length: bool = False  # If True, allows numbers with different lengths (e.g., 2-digit + 3-digit). If False, all numbers are padded to 'digits' length.
@@ -25,7 +25,7 @@ class DataProcessConfig(BaseModel):
 
 @cli.command(singleton=True)
 def main(config: DataProcessConfig):
-    assert config.dataset_mode in {"vanilla", "lilavati1"}, f"dataset_mode must be 'vanilla' or 'lilavati1', got {config.dataset_mode}"
+    assert config.dataset_mode in {"vanilla", "lilavati1", "lilavati2"}, f"dataset_mode must be 'vanilla', 'lilavati1', or 'lilavati2', got {config.dataset_mode}"
     assert config.digits >= 1, f"digits must be >= 1, got {config.digits}"
     assert config.sample_ratio is None or 0.0 < config.sample_ratio <= 1.0, f"sample_ratio must be in (0.0, 1.0], got {config.sample_ratio}"
     assert config.min_carries is None or config.min_carries >= 0, f"min_carries must be >= 0, got {config.min_carries}"
@@ -291,8 +291,8 @@ def main(config: DataProcessConfig):
     vocab_map['+'] = 12
     vocab_map['='] = 13
     
-    # Add <CAR> token for lilavati1 mode
-    if config.dataset_mode == "lilavati1":
+    # Add <CAR> token for lilavati1/lilavati2 mode
+    if config.dataset_mode in {"lilavati1", "lilavati2"}:
         vocab_map['<CAR>'] = 14
         vocab_size = 15  # 0..14
         CAR_TOKEN_ID = 14
@@ -536,12 +536,12 @@ def main(config: DataProcessConfig):
                 inp_seq = encode(prefix) + [MASK_ID] * max_result_digits
                 label_seq = [IGNORE_LABEL_ID] * len(encode(prefix)) + encode(s_res_padded)
                 assert CAR_TOKEN_ID is None or CAR_TOKEN_ID not in label_seq, "Vanilla mode should not contain <CAR> token"
-            else:  # lilavati1
+            else:  # lilavati1 or lilavati2
                 carries = compute_carries(a, b, carry_digits)
                 s_carries = ''.join(str(c) for c in carries)
                 inp_seq = encode(prefix) + [MASK_ID] * max_result_digits + [CAR_TOKEN_ID] + [MASK_ID] * carry_digits
                 label_seq = [IGNORE_LABEL_ID] * len(encode(prefix)) + encode(s_res_padded) + [CAR_TOKEN_ID] + encode(s_carries)
-                assert label_seq.count(CAR_TOKEN_ID) == 1, f"Lilavati-1 mode must have exactly one <CAR> token, got {label_seq.count(CAR_TOKEN_ID)}"
+                assert label_seq.count(CAR_TOKEN_ID) == 1, f"Lilavati mode must have exactly one <CAR> token, got {label_seq.count(CAR_TOKEN_ID)}"
             
             inputs.append(inp_seq)
             labels.append(label_seq)
@@ -621,7 +621,7 @@ def main(config: DataProcessConfig):
     # Generate dataset statistics and README
     generate_dataset_stats(config, splits, vocab_map, vocab_size, max_seq_len, total_possible)
     
-    # If also_output_dir is set, generate the other mode as well
+    # If also_output_dir is set, generate the other mode as well (vanilla <-> lilavati1)
     if config.also_output_dir is not None:
         other_mode = "lilavati1" if config.dataset_mode == "vanilla" else "vanilla"
         print(f"\nAlso generating {other_mode} mode dataset to {config.also_output_dir}...")
@@ -689,7 +689,7 @@ def main(config: DataProcessConfig):
                 if other_mode == "vanilla":
                     inp_seq = encode_other(prefix) + [MASK_ID] * max_result_digits
                     label_seq = [IGNORE_LABEL_ID] * len(encode_other(prefix)) + encode_other(s_res_padded)
-                else:  # lilavati1
+                else:  # lilavati1 (other_mode is always lilavati1 or vanilla, not lilavati2)
                     carries = compute_carries(a, b, carry_digits)
                     s_carries = ''.join(str(c) for c in carries)
                     inp_seq = encode_other(prefix) + [MASK_ID] * max_result_digits + [other_CAR_TOKEN_ID] + [MASK_ID] * carry_digits
@@ -803,7 +803,7 @@ def generate_dataset_stats(config: DataProcessConfig, splits: dict, vocab_map: d
         vocab_desc.append(f"- `{i+2}`: '{i}'")
     vocab_desc.append("- `12`: '+'")
     vocab_desc.append("- `13`: '='")
-    if config.dataset_mode == "lilavati1":
+    if config.dataset_mode in {"lilavati1", "lilavati2"}:
         vocab_desc.append("- `14`: '<CAR>' (carry token)")
     
     # Generate examples
@@ -835,7 +835,7 @@ def generate_dataset_stats(config: DataProcessConfig, splits: dict, vocab_map: d
         for a, b in pairs:
             res = a + b
             all_results.append(res)
-            if config.dataset_mode == "lilavati1":
+            if config.dataset_mode in {"lilavati1", "lilavati2"}:
                 carries = compute_carries(a, b, config.digits)
                 all_carries.extend(carries)
     
@@ -904,7 +904,7 @@ def generate_dataset_stats(config: DataProcessConfig, splits: dict, vocab_map: d
   - {digit_counts.get(config.digits+1, 0):,} results with {config.digits+1} digits ({digit_counts.get(config.digits+1, 0)/total_examples*100:.1f}%)
 """
     
-    if config.dataset_mode == "lilavati1":
+    if config.dataset_mode in {"lilavati1", "lilavati2"}:
         carry_counter = Counter(all_carries)
         readme_content += f"""
 ### Carry Distribution Statistics
@@ -1015,7 +1015,7 @@ This dataset is designed for training Tiny Recursive Models (TRM) on {config.dig
 - **Sequence Accuracy**: Exact match accuracy (all digits correct)
 """
     
-    if config.dataset_mode == "lilavati1":
+    if config.dataset_mode in {"lilavati1", "lilavati2"}:
         readme_content += "- **Carry Accuracy**: Accuracy of carry predictions\n"
     
     readme_content += f"""

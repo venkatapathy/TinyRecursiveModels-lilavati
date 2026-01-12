@@ -92,7 +92,10 @@ def load_model_from_checkpoint(checkpoint_path: str, config_path: str = None, da
         vocab_size=metadata.vocab_size,
         seq_len=metadata.seq_len,
         num_puzzle_identifiers=metadata.num_puzzle_identifiers,
-        causal=False
+        causal=False,
+        # Lilavati2: pass dataset_mode and digits to model
+        dataset_mode=dataset_mode,
+        digits=digits,
     )
     
     # Load model class
@@ -102,6 +105,9 @@ def load_model_from_checkpoint(checkpoint_path: str, config_path: str = None, da
     # Create model
     with torch.device("cuda"):
         model = model_cls(model_cfg)
+        # Pass dataset_mode and digits to loss head for lilavati2 carry predictions
+        loss_extra["dataset_mode"] = dataset_mode
+        loss_extra["digits"] = digits
         model = loss_head_cls(model, **loss_extra)
         
         # Load checkpoint

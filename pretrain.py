@@ -55,7 +55,7 @@ class PretrainConfig(pydantic.BaseModel):
     evaluators: List[EvaluatorConfig] = []
     
     # Dataset mode
-    dataset_mode: str = "vanilla"  # "vanilla" or "lilavati1"
+    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", or "lilavati2"
     digits: int = 3
 
     # Hyperparams
@@ -129,7 +129,10 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False  # Non-autoregressive
+        causal=False,  # Non-autoregressive
+        # Lilavati2: pass dataset_mode and digits to model
+        dataset_mode=config.dataset_mode,
+        digits=config.digits,
     )
 
     # Instantiate model with loss head
@@ -139,7 +142,11 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         print(model)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        # Pass dataset_mode and digits to loss head for lilavati2 carry loss computation
+        loss_head_extra = dict(config.arch.loss.__pydantic_extra__)  # type: ignore
+        loss_head_extra["dataset_mode"] = config.dataset_mode
+        loss_head_extra["digits"] = config.digits
+        model = loss_head_cls(model, **loss_head_extra)
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
@@ -609,13 +616,15 @@ def launch(hydra_config: DictConfig):
         # Set W&B project name based on dataset_mode
         project_name = config.project_name if config.project_name is not None else "trm-lilavati"
         
-        # Ensure run_name follows convention: vanilla_trm_d3 or lilavati1_trm_d3
+        # Ensure run_name follows convention: vanilla_trm_d3 or lilavati1_trm_d3 or lilavati2_trm_d3
         run_name = config.run_name
         if run_name is None:
             if config.dataset_mode == "vanilla":
                 run_name = f"vanilla_trm_d{config.digits}"
             elif config.dataset_mode == "lilavati1":
                 run_name = f"lilavati1_trm_d{config.digits}"
+            elif config.dataset_mode == "lilavati2":
+                run_name = f"lilavati2_trm_d{config.digits}"
             else:
                 run_name = f"{config.dataset_mode}_trm_d{config.digits}"
         
@@ -624,10 +633,12 @@ def launch(hydra_config: DictConfig):
             "model": "TRM",
             "variant": config.dataset_mode,
             "digits": config.digits,
-            "include_carry": config.dataset_mode == "lilavati1",
+            "include_carry": config.dataset_mode in {"lilavati1", "lilavati2"},
         })
-        if config.dataset_mode == "lilavati1":
+        if config.dataset_mode in {"lilavati1", "lilavati2"}:
             wandb_config["carry_token"] = "<CAR>"
+        if config.dataset_mode == "lilavati2":
+            wandb_config["separate_carry_head"] = True
         
         wandb.init(project=project_name, name=run_name, config=wandb_config, settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)

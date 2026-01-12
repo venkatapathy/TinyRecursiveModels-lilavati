@@ -6,8 +6,8 @@ hydra:
   output_subdir: null
 
 # Data path
-data_paths: ['data/addition5_vanilla']
-data_paths_test: ['data/addition5_vanilla']
+data_paths: ['data/addition5_vanilla_varied']
+data_paths_test: ['data/addition5_vanilla_varied']
 
 evaluators:
   - name: addition@AdditionEvaluator

@@ -199,8 +199,8 @@ class AdditionEvaluator:
                     self.carry_correct += carry_matches
                     self.carry_total += self.digits
                     
-                    # Sequence-level accuracy (both result and carries must be correct)
-                    if pred_res == expected_res and carry_str == expected_carry_str:
+                    # Sequence-level accuracy (only result needs to be correct; carries are tracked separately)
+                    if pred_res == expected_res:
                         self.sequence_correct += 1
                 
             except Exception as e:

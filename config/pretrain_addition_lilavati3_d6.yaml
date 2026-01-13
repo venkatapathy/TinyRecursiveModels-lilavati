@@ -42,6 +42,6 @@ min_eval_interval: 0
 project_name: "trm-lilavati"
 run_name: "lilavati3_trm_d6"
 
-# Lilavati3 specific: carry loss weight (can be tuned)
+# Lilavati3 specific: carry probe loss weight (auxiliary, λ=0.05)
 arch:
-  carry_loss_weight: 1.0
+  carry_loss_weight: 0.05

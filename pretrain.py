@@ -288,6 +288,33 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     )
 
 
+def compute_carry_loss_weight(
+    base_weight: float,
+    current_step: int,
+    total_steps: int,
+    warmup_steps: int = 0,
+    decay_start_ratio: float = 0.2,  # Start decay at 20% of training
+    min_ratio: float = 0.1,  # Decay to 10% of original weight
+):
+    """
+    Schedule for carry_loss_weight:
+    - Constant during warmup (if warmup_steps > 0)
+    - Cosine decay from decay_start_ratio to end of training
+    - Final value is base_weight * min_ratio
+    """
+    if current_step < warmup_steps:
+        return base_weight
+    
+    decay_start_step = int(total_steps * decay_start_ratio)
+    if current_step < decay_start_step:
+        return base_weight
+    
+    # Cosine decay from decay_start_step to total_steps
+    progress = float(current_step - decay_start_step) / float(max(1, total_steps - decay_start_step))
+    # Cosine decay from 1.0 to min_ratio
+    decayed_ratio = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_weight * decayed_ratio
+
 
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
     data_paths =config.data_paths_test if len(config.data_paths_test)>0 else config.data_paths
@@ -316,6 +343,34 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if train_state.carry is None:
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+
+    # Update carry_loss_weight if using lilavati3 and schedule is enabled
+    carry_loss_weight_this_step = None
+    if hasattr(config.arch, 'carry_loss_weight'):
+        base_weight = config.arch.carry_loss_weight
+        # Check if schedule is enabled (via arch config or default)
+        schedule_enabled = False
+        schedule_config = {}
+        
+        if hasattr(config.arch, 'carry_loss_weight_schedule'):
+            schedule_config = config.arch.carry_loss_weight_schedule
+            if isinstance(schedule_config, dict):
+                schedule_enabled = schedule_config.get('enabled', False)
+        
+        if schedule_enabled and hasattr(train_state.model, 'carry_loss_weight'):
+            warmup = schedule_config.get('warmup_steps', 0)
+            decay_start = schedule_config.get('decay_start_ratio', 0.2)
+            min_ratio = schedule_config.get('min_ratio', 0.1)
+            
+            carry_loss_weight_this_step = compute_carry_loss_weight(
+                base_weight=base_weight,
+                current_step=train_state.step,
+                total_steps=train_state.total_steps,
+                warmup_steps=warmup,
+                decay_start_ratio=decay_start,
+                min_ratio=min_ratio,
+            )
+            train_state.model.carry_loss_weight = carry_loss_weight_this_step
 
     # Forward
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
@@ -357,12 +412,35 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
             
-            # Postprocess
+            # Postprocess - FIX: Metrics that are already normalized should not be divided
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
-            reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
+            
+            # Metrics that are already normalized (0-1) should not be divided
+            # - carry_accuracy: already normalized in losses.py line 236
+            # - carry_probe_loss: already normalized per sample in losses.py line 228
+            already_normalized = {"carry_accuracy", "carry_probe_loss"}
+            
+            processed_metrics = {}
+            for k, v in reduced_metrics.items():
+                if k in already_normalized:
+                    # Already normalized, use as-is
+                    processed_metrics[f"train/{k}"] = v
+                elif k.endswith("loss"):
+                    # Losses: divide by global_batch_size
+                    processed_metrics[f"train/{k}"] = v / global_batch_size
+                else:
+                    # Other metrics (sums): divide by count
+                    processed_metrics[f"train/{k}"] = v / count
 
-            reduced_metrics["train/lr"] = lr_this_step
-            return reduced_metrics
+            processed_metrics["train/lr"] = lr_this_step
+            
+            # Log current carry_loss_weight if available
+            if carry_loss_weight_this_step is not None:
+                processed_metrics["train/carry_loss_weight"] = carry_loss_weight_this_step
+            elif hasattr(train_state.model, 'carry_loss_weight'):
+                processed_metrics["train/carry_loss_weight"] = train_state.model.carry_loss_weight
+            
+            return processed_metrics
 
 def evaluate(
     config: PretrainConfig,
@@ -507,6 +585,47 @@ def evaluate(
 
     return reduced_metrics
 
+def _to_plain_python(obj):
+    """Recursively convert any object to plain Python types (dict, list, primitives) for YAML serialization."""
+    # Handle None and primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    
+    # Handle dict - filter out any non-serializable values
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            # Skip keys that are methods or callables
+            if callable(v):
+                continue
+            # Skip private/internal attributes
+            if isinstance(k, str) and (k.startswith('_') or k == 'model_dump'):
+                continue
+            try:
+                result[str(k)] = _to_plain_python(v)
+            except:
+                continue  # Skip problematic values
+        return result
+    
+    # Handle list/tuple
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain_python(item) for item in obj if not callable(item)]
+    
+    # Handle Pydantic models
+    if hasattr(obj, 'model_dump') and not isinstance(obj, dict):
+        try:
+            return _to_plain_python(obj.model_dump(mode='python'))
+        except:
+            pass
+    
+    # Handle callable objects - skip them
+    if callable(obj):
+        return None  # Skip callables entirely
+    
+    # Fallback: convert to string
+    return str(obj)
+
+
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
         return
@@ -527,7 +646,12 @@ def save_code_and_config(config: PretrainConfig):
     # Dump config as yaml
     config_file = os.path.join(config.checkpoint_path, "all_config.yaml")
     with open(config_file, "wt") as f:
-        yaml.dump(config.model_dump(), f)
+        # Convert to plain Python types recursively to avoid YAML serialization issues
+        # model_dump(mode='python') should already return plain types, but we clean it up further
+        config_dict = config.model_dump(mode='python')
+        plain_dict = _to_plain_python(config_dict)
+        # Use SafeDumper to avoid issues with special objects
+        yaml.safe_dump(plain_dict, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     # Log code
     wandb.run.log_code(config.checkpoint_path)

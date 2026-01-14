@@ -44,4 +44,9 @@ run_name: "lilavati3_trm_d2"
 
 # Lilavati3 specific: carry probe loss weight (auxiliary, λ=0.05)
 arch:
-  carry_loss_weight: 1
+  carry_loss_weight: 1.0
+  carry_loss_weight_schedule:
+    enabled: true
+    warmup_steps: 1000  # Keep full weight for first 1000 steps
+    decay_start_ratio: 0.2  # Start decay at 20% of training (after warmup)
+    min_ratio: 0.1  # Decay to 10% of original weight by end

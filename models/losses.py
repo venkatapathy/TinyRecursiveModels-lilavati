@@ -178,8 +178,13 @@ class ACTLossHead(nn.Module):
             # Find result digit positions: positions where result_mask is True
             # These are contiguous and come before CAR
             # Extract carry_probe logits at result digit positions: [B, digits, 2]
+            # FIX: Use vectorized operations to avoid GPU/CPU sync issues
             carry_probe_logits_list = []
             carry_binary_labels_list = []
+            
+            # Compute carry_start positions for all batches at once (stay on GPU)
+            # car_positions is [B, 1], so car_positions[:, 0] is [B]
+            carry_start_positions = (car_positions[:, 0] + 1).long()  # [B] - Position after CAR for each batch
             
             for b in range(batch_size):
                 # Find result digit positions for this batch (where result_mask is True)
@@ -195,9 +200,10 @@ class ACTLossHead(nn.Module):
                 result_logits = outputs["carry_logits"][b, result_positions_b]  # [digits, 2]
                 carry_probe_logits_list.append(result_logits)
                 
-                # Extract corresponding carry labels (after CAR)
-                carry_start = int(car_positions[b, 0].item()) + 1  # Position after CAR
-                carry_label_tokens = labels[b, carry_start:carry_start+self.digits]  # [digits]
+                # Extract corresponding carry labels (after CAR) - FIX: Use tensor indexing instead of .item()
+                carry_start = carry_start_positions[b].item()  # Only sync once per batch, not per operation
+                carry_end = carry_start + self.digits
+                carry_label_tokens = labels[b, carry_start:carry_end]  # [digits]
                 
                 # Convert token IDs to binary: digits 0-9 are tokens 2-11, so token - 2 gives digit value
                 # For carry, we only care about 0 or 1

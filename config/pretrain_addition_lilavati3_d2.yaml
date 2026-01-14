@@ -5,16 +5,16 @@ defaults:
 hydra:
   output_subdir: null
 
-# Data path
-data_paths: ['data/addition6_vanilla_strict_mixed_fixed']
-data_paths_test: ['data/addition6_vanilla_strict_mixed_fixed']
+# Data path (lilavati3 uses same data format as lilavati1/lilavati2)
+data_paths: ['data/addition2_lilavati1']
+data_paths_test: ['data/addition2_lilavati1']
 
 evaluators:
   - name: addition@AdditionEvaluator
 
 # Dataset mode
-dataset_mode: "vanilla"
-digits: 6
+dataset_mode: "lilavati3"
+digits: 2
 
 # Hyperparams - Training
 global_batch_size: 256
@@ -40,4 +40,8 @@ seed: 42
 min_eval_interval: 0
 
 project_name: "trm-lilavati"
-run_name: "vanilla_trm_d6"
+run_name: "lilavati3_trm_d2"
+
+# Lilavati3 specific: carry probe loss weight (auxiliary, λ=0.05)
+arch:
+  carry_loss_weight: 1

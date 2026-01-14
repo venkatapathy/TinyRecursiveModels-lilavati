@@ -19,7 +19,7 @@ digits: 6
 # Hyperparams - Training
 global_batch_size: 256
 
-epochs: 10
+epochs: 100
 eval_interval: 1
 checkpoint_every_eval: False
 
@@ -44,4 +44,4 @@ run_name: "lilavati3_trm_d6"
 
 # Lilavati3 specific: carry probe loss weight (auxiliary, λ=0.05)
 arch:
-  carry_loss_weight: 0.05
+  carry_loss_weight: 1

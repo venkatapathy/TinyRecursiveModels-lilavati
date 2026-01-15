@@ -315,19 +315,19 @@ def main(config: DataProcessConfig):
     # 11: '9'
     # 12: '+'
     # 13: '='
-    # 14: '<CAR>' (only for lilavati1 mode)
+    # 14: '<CAR>' (only for lilavati2/lilavati3 mode)
     
     vocab_map = {str(i): i + 2 for i in range(10)}
     vocab_map['+'] = 12
     vocab_map['='] = 13
     
-    # Add <CAR> token for lilavati modes
+    # Add <CAR> token for lilavati modes (lilavati1 now uses same format as lilavati3)
     if config.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
         vocab_map['<CAR>'] = 14
         vocab_size = 15  # 0..14
         CAR_TOKEN_ID = 14
     else:
-        vocab_size = 14  # 0..13
+        vocab_size = 14  # 0..13 (vanilla only)
         CAR_TOKEN_ID = None
     
     MASK_ID = 1
@@ -593,7 +593,15 @@ def main(config: DataProcessConfig):
                 inp_seq = encode(prefix) + [MASK_ID] * max_result_digits
                 label_seq = [IGNORE_LABEL_ID] * len(encode(prefix)) + encode(s_res_padded)
                 assert CAR_TOKEN_ID is None or CAR_TOKEN_ID not in label_seq, "Vanilla mode should not contain <CAR> token"
-            else:  # lilavati1 or lilavati2
+            elif config.dataset_mode == "lilavati1":
+                # Lilavati1: same format as lilavati3 (single sequence with CAR token)
+                # But uses only lm_head for both result and carry (unlike lilavati3 which uses both heads)
+                carries = compute_carries(a, b, carry_digits)
+                s_carries = ''.join(str(c) for c in carries)
+                inp_seq = encode(prefix) + [MASK_ID] * max_result_digits + [CAR_TOKEN_ID] + [MASK_ID] * carry_digits
+                label_seq = [IGNORE_LABEL_ID] * len(encode(prefix)) + encode(s_res_padded) + [CAR_TOKEN_ID] + encode(s_carries)
+                assert label_seq.count(CAR_TOKEN_ID) == 1, f"Lilavati mode must have exactly one <CAR> token, got {label_seq.count(CAR_TOKEN_ID)}"
+            else:  # lilavati2 or lilavati3
                 carries = compute_carries(a, b, carry_digits)
                 s_carries = ''.join(str(c) for c in carries)
                 inp_seq = encode(prefix) + [MASK_ID] * max_result_digits + [CAR_TOKEN_ID] + [MASK_ID] * carry_digits

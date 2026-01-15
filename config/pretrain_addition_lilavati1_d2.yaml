@@ -5,16 +5,16 @@ defaults:
 hydra:
   output_subdir: null
 
-# Data path (lilavati3 uses same data format as lilavati1/lilavati2)
-data_paths: ['data/addition6_lilavati1_strict_mixed_fixed']
-data_paths_test: ['data/addition6_lilavati1_strict_mixed_fixed']
+# Data path (lilavati1 now uses same format as lilavati3 - single sequence with CAR token)
+data_paths: ['data/addition2_lilavati1_strict_mixed_fixed']
+data_paths_test: ['data/addition2_lilavati1_strict_mixed_fixed']
 
 evaluators:
   - name: addition@AdditionEvaluator
 
 # Dataset mode
-dataset_mode: "lilavati3"
-digits: 6
+dataset_mode: "lilavati1"
+digits: 2
 
 # Hyperparams - Training
 global_batch_size: 256
@@ -26,7 +26,7 @@ checkpoint_every_eval: False
 lr: 1e-4
 lr_min_ratio: 0.01
 lr_warmup_steps: 100
-grad_clip: 0.0
+grad_clip: 1.0
 
 beta1: 0.9
 beta2: 0.95
@@ -40,13 +40,13 @@ seed: 42
 min_eval_interval: 0
 
 project_name: "trm-lilavati"
-run_name: "lilavati3_trm_d6_w2"
+run_name: "lilavati1_trm_d2_w0.5"
 
-# Lilavati3 specific: carry loss weight (lambda hyperparameter)
+# Lilavati1 specific: carry loss weight (lambda hyperparameter)
 arch:
-  carry_loss_weight: 2
+  carry_loss_weight: 0.5
   carry_loss_weight_schedule:
     enabled: false
     warmup_steps: 1000  # Keep full weight for first 1000 steps
     decay_start_ratio: 0.2  # Start decay at 20% of training (after warmup)
-    min_ratio: 0.5  # Decay to 10% of original weight by end
+    min_ratio: 0.5  # Decay to 50% of original weight by end

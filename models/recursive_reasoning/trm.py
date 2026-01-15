@@ -135,13 +135,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
         
-        # Lilavati2: separate carry head (same architecture as lm_head)
-        if self.config.dataset_mode == "lilavati2":
-            self.carry_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        
-        # Lilavati3: tiny carry probe (binary classification: 0 or 1)
+        # Lilavati3: separate carry head (lilavati1 and lilavati2 use only lm_head)
         if self.config.dataset_mode == "lilavati3":
-            self.carry_probe = CastedLinear(self.config.hidden_size, 2, bias=True)  # Binary: {0, 1}
+            self.carry_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -195,9 +191,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        # Ensure tensors are on the same device as model buffers (H_init, L_init)
+        device = self.H_init.device
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
@@ -231,20 +229,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         
-        # Lilavati2: separate carry logits (for predictions)
-        # Lilavati3: carry probe logits (auxiliary only, not used for predictions)
+        # Compute heads based on dataset mode
+        # For lilavati1/lilavati2: only lm_head for both result and carry (same as vanilla but with CAR token)
+        # For lilavati3: both heads needed for same input (result and carry positions in same sequence)
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         carry_logits = None
-        if self.config.dataset_mode == "lilavati2":
+        if self.config.dataset_mode == "lilavati3":
             carry_logits = self.carry_head(z_H)[:, self.puzzle_emb_len:]
-        elif self.config.dataset_mode == "lilavati3":
-            # Carry probe: takes z_H at result digit positions
-            # Output shape: [B, digits, 2] for binary classification
-            carry_probe_logits = self.carry_probe(z_H)[:, self.puzzle_emb_len:]
-            # Store as carry_logits for loss computation (but won't be used for predictions)
-            carry_logits = carry_probe_logits
+        
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), carry_logits
 
@@ -263,12 +257,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
 
         return TinyRecursiveReasoningModel_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
+            steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
             
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
@@ -291,7 +286,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             "q_continue_logits": q_continue_logits
         }
         
-        # Lilavati2: add carry_logits to outputs
+        # Lilavati1/lilavati2/lilavati3: add carry_logits to outputs
         if carry_logits is not None:
             outputs["carry_logits"] = carry_logits
 

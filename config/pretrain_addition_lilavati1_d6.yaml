@@ -5,9 +5,9 @@ defaults:
 hydra:
   output_subdir: null
 
-# Data path
-data_paths: ['data/addition6_lilavati1_strict_mixed_fixed']
-data_paths_test: ['data/addition6_lilavati1_strict_mixed_fixed']
+# Data paths: vanilla for result labels, lilavati1 for carry labels
+data_paths: ['data/addition6_vanilla_strict_mixed_fixed', 'data/addition6_lilavati1_strict_mixed_fixed']
+data_paths_test: ['data/addition6_vanilla_strict_mixed_fixed', 'data/addition6_lilavati1_strict_mixed_fixed']
 
 evaluators:
   - name: addition@AdditionEvaluator
@@ -19,7 +19,7 @@ digits: 6
 # Hyperparams - Training
 global_batch_size: 256
 
-epochs: 10
+epochs: 100
 eval_interval: 1
 checkpoint_every_eval: False
 
@@ -40,4 +40,13 @@ seed: 42
 min_eval_interval: 0
 
 project_name: "trm-lilavati"
-run_name: "lilavati1_trm_d6"
+run_name: "lilavati1_trm_d6_w0.5"
+
+# Lilavati1 specific: carry loss weight (lambda hyperparameter)
+arch:
+  carry_loss_weight: 0.5
+  carry_loss_weight_schedule:
+    enabled: false
+    warmup_steps: 1000  # Keep full weight for first 1000 steps
+    decay_start_ratio: 0.2  # Start decay at 20% of training (after warmup)
+    min_ratio: 0.5  # Decay to 50% of original weight by end

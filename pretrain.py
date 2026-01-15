@@ -384,7 +384,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 dist.all_reduce(param.grad)
     
     # Gradient clipping
-    if config.grad_clip is not None:
+    if config.grad_clip is not None and config.grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), config.grad_clip)
             
     # Apply optimizer
@@ -416,9 +416,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
             
             # Metrics that are already normalized (0-1) should not be divided
-            # - carry_accuracy: already normalized in losses.py line 236
-            # - carry_probe_loss: already normalized per sample in losses.py line 228
-            already_normalized = {"carry_accuracy", "carry_probe_loss"}
+            # - carry_accuracy: already normalized in losses.py
+            # - carry_loss: already normalized per sample in losses.py
+            already_normalized = {"carry_accuracy", "carry_loss"}
             
             processed_metrics = {}
             for k, v in reduced_metrics.items():
@@ -507,7 +507,16 @@ def evaluate(
             del carry, loss, preds, batch, all_finish
 
             # Aggregate metrics
-            set_id = set_ids[set_name]
+            # Normalize set_name: remove trailing digits added for multiple dataset paths (e.g., "all1" -> "all")
+            set_name_normalized = set_name
+            for original_set in set_ids.keys():
+                if set_name.startswith(original_set) and set_name != original_set:
+                    # Check if it's just the original set name with a number appended
+                    suffix = set_name[len(original_set):]
+                    if suffix.isdigit():
+                        set_name_normalized = original_set
+                        break
+            set_id = set_ids[set_name_normalized]
 
             if metric_values is None:
                 metric_keys = list(
@@ -720,9 +729,15 @@ def launch(hydra_config: DictConfig):
         eval_loader = eval_metadata = None
 
     try:
-        evaluators = create_evaluators(config, eval_metadata)
-    except:
-        print("No evaluator found")
+        if eval_metadata is not None:
+            evaluators = create_evaluators(config, eval_metadata)
+        else:
+            print("No eval metadata, skipping evaluators")
+            evaluators = []
+    except Exception as e:
+        print(f"No evaluator found: {e}")
+        import traceback
+        traceback.print_exc()
         evaluators = []
 
     # Train state

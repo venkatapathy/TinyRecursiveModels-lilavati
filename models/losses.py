@@ -59,44 +59,48 @@ class ACTLossHead(nn.Module):
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
-        # Model logits
-        # B x SeqLen x D
+        # Single forward pass for all modes (including lilavati1 now)
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
+        labels_carry = new_carry.current_data.get("labels_carry", None)  # From lilavati dataset
 
-        # For lilavati2/lilavati3: need to compute masks before predictions
-        if self.dataset_mode in {"lilavati2", "lilavati3"} and "carry_logits" in outputs:
-            # Find CAR token positions from INPUTS (not labels, as labels may be dummy during inference)
+        # For lilavati1/lilavati2/lilavati3: need to compute masks before predictions
+        # lilavati1 now uses same format as lilavati3 (single sequence with CAR token)
+        if self.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
             inputs = new_carry.current_data["inputs"]
+            batch_size, seq_len = labels.shape
+            positions = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
+            
+            # Find CAR token positions from INPUTS (not labels, as labels may be dummy during inference)
             car_mask_inputs = (inputs == CAR_TOKEN_ID)
             car_mask_labels = (labels == CAR_TOKEN_ID)
             
             # Create position indices
-            batch_size, seq_len = labels.shape
-            positions = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
-            
-            # Find CAR position from inputs (where CAR token appears)
             car_positions = car_mask_inputs.float().argmax(dim=-1, keepdim=True)  # [B, 1]
             
             # Carry mask: positions after CAR
             carry_pos_mask = (positions > car_positions)
             
-            # Combine predictions: use lm_head for result positions, carry_head for carry positions
-            # For lilavati3: only use lm_head (carry_probe is auxiliary, not used for predictions)
-            lm_preds = torch.argmax(outputs["logits"], dim=-1)
-            if self.dataset_mode == "lilavati2":
+            if self.dataset_mode in {"lilavati1", "lilavati2"}:
+                # Lilavati1/lilavati2: use only lm_head for both result and carry positions
+                combined_preds = torch.argmax(outputs["logits"], dim=-1)
+            else:
+                # Lilavati3: use lm_head for result positions, carry_head for carry positions
+                lm_preds = torch.argmax(outputs["logits"], dim=-1)
                 carry_preds = torch.argmax(outputs["carry_logits"], dim=-1)
                 combined_preds = torch.where(carry_pos_mask, carry_preds, lm_preds)
-            else:  # lilavati3: only use lm_head predictions
-                combined_preds = lm_preds
             
             # For loss computation, use labels to find CAR mask
             car_mask = car_mask_labels
+            car_positions = car_positions
+            carry_pos_mask = carry_pos_mask
         else:
             combined_preds = None
             car_mask = None
             carry_pos_mask = None
             car_positions = None
+            result_pos_mask = None
+            eq_positions = None
 
         with torch.no_grad():
             # Preds - for lilavati2, use combined predictions
@@ -104,6 +108,12 @@ class ACTLossHead(nn.Module):
                 outputs["preds"] = combined_preds
             else:
                 outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+            
+            # For lilavati1/lilavati2: predictions come from lm_head only (no separate carry_preds)
+            # For lilavati3: carry predictions come from carry_head
+            if self.dataset_mode == "lilavati3" and "carry_logits" in outputs:
+                carry_preds = torch.argmax(outputs["carry_logits"], dim=-1)
+                outputs["carry_preds"] = carry_preds
 
             # Correctness
             mask = (labels != IGNORE_LABEL_ID)
@@ -114,7 +124,9 @@ class ACTLossHead(nn.Module):
             seq_is_correct = is_correct.sum(-1) == loss_counts
             
             # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
+            # Metrics (halted)
+            halted_for_metrics = new_carry.halted
+            valid_metrics = halted_for_metrics & (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
                 
@@ -128,13 +140,68 @@ class ACTLossHead(nn.Module):
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "steps":          torch.where(valid_metrics, (new_carry.steps[:len(halted_for_metrics)] if len(new_carry.steps) > len(halted_for_metrics) else new_carry.steps), 0).sum(),
             }
 
         # Losses
         
-        # For lilavati2: compute separate losses for result and carry positions
-        if self.dataset_mode == "lilavati2" and "carry_logits" in outputs:
+        # For lilavati1: same format as lilavati3 but uses only lm_head for both result and carry
+        if self.dataset_mode == "lilavati1" and car_positions is not None:
+            # Result mask: valid positions at or before CAR (including CAR itself)
+            result_mask = mask & (positions <= car_positions)
+            # Carry mask: valid positions after CAR
+            carry_mask = mask & carry_pos_mask
+            
+            # Compute result loss (using lm_head logits)
+            result_counts = result_mask.sum(-1)
+            result_divisor = result_counts.clamp_min(1).unsqueeze(-1)
+            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=result_mask) / result_divisor).sum()
+            
+            # Compute carry loss (using lm_head logits - KEY DIFFERENCE from lilavati3)
+            carry_counts = carry_mask.sum(-1)
+            carry_divisor = carry_counts.clamp_min(1).unsqueeze(-1)
+            carry_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=carry_mask) / carry_divisor).sum()
+            
+            # Carry accuracy metrics
+            with torch.no_grad():
+                carry_correct = carry_mask & (outputs["preds"] == labels)
+                carry_accuracy = torch.where(valid_metrics, (carry_correct.to(torch.float32) / carry_divisor).sum(-1), 0).sum()
+                metrics["carry_accuracy"] = carry_accuracy
+                metrics["carry_loss"] = carry_loss.detach()
+            
+            # Total loss: L_y + λ * L_carry (both using lm_head)
+            total_lm_loss = lm_loss + self.carry_loss_weight * carry_loss
+        
+        # For lilavati2: single unified loss using only lm_head logits for entire sequence
+        elif self.dataset_mode == "lilavati2" and car_positions is not None:
+            # Compute single unified cross-entropy loss over entire sequence (result + carry positions)
+            # using only lm_head logits
+            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+            total_lm_loss = lm_loss  # For lilavati2, total loss is just the unified loss
+            
+            # For metrics: compute separate accuracies for result and carry positions
+            result_mask = mask & (positions <= car_positions)
+            carry_mask = mask & carry_pos_mask
+            
+            with torch.no_grad():
+                # Result accuracy
+                result_counts = result_mask.sum(-1)
+                result_divisor = result_counts.clamp_min(1).unsqueeze(-1)
+                result_correct = result_mask & (outputs["preds"] == labels)
+                result_accuracy = torch.where(valid_metrics, (result_correct.to(torch.float32) / result_divisor).sum(-1), 0).sum()
+                
+                # Carry accuracy
+                carry_counts = carry_mask.sum(-1)
+                carry_divisor = carry_counts.clamp_min(1).unsqueeze(-1)
+                carry_correct = carry_mask & (outputs["preds"] == labels)
+                carry_accuracy = torch.where(valid_metrics, (carry_correct.to(torch.float32) / carry_divisor).sum(-1), 0).sum()
+                
+                metrics["carry_accuracy"] = carry_accuracy
+                # Store result accuracy separately for clarity
+                metrics["result_accuracy"] = result_accuracy
+        
+        # For lilavati3: uses carry_head (separate from lilavati2 which uses only lm_head) - compute separate losses for result and carry positions
+        elif self.dataset_mode == "lilavati3" and "carry_logits" in outputs:
             # Result mask: valid positions at or before CAR (including CAR itself, since lm_head predicts it)
             result_mask = mask & (positions <= car_positions)
             # Carry mask: valid positions after CAR
@@ -157,114 +224,11 @@ class ACTLossHead(nn.Module):
                 metrics["carry_accuracy"] = carry_accuracy
                 metrics["carry_loss"] = carry_loss.detach()
             
+            # Total loss: L_y + λ * L_carry
             total_lm_loss = lm_loss + self.carry_loss_weight * carry_loss
         
-        # For lilavati3: carry as auxiliary probe only (no interference with y)
-        elif self.dataset_mode == "lilavati3" and "carry_logits" in outputs and self.training:
-            # Result mask: valid positions at or before CAR (result digits)
-            result_mask = mask & (positions <= car_positions)
-            # Carry mask: valid positions after CAR (carry digits)
-            carry_mask = mask & carry_pos_mask
-            
-            # Compute main loss (using lm_head logits) - unchanged vanilla path
-            result_counts = result_mask.sum(-1)
-            result_divisor = result_counts.clamp_min(1).unsqueeze(-1)
-            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=result_mask) / result_divisor).sum()
-            
-            # Compute carry probe loss (auxiliary, only during training)
-            # carry_probe predicts binary {0,1} at result digit positions
-            # Align with carry labels at carry positions (both have self.digits positions)
-            
-            # Find result digit positions: positions where result_mask is True
-            # These are contiguous and come before CAR
-            # Extract carry_probe logits at result digit positions: [B, digits, 2]
-            # FIX: Use vectorized operations to avoid GPU/CPU sync issues
-            carry_probe_logits_list = []
-            carry_binary_labels_list = []
-            
-            # Compute carry_start positions for all batches at once (stay on GPU)
-            # car_positions is [B, 1], so car_positions[:, 0] is [B]
-            carry_start_positions = (car_positions[:, 0] + 1).long()  # [B] - Position after CAR for each batch
-            
-            for b in range(batch_size):
-                # Find result digit positions for this batch (where result_mask is True)
-                result_positions_b = torch.where(result_mask[b])[0]  # [num_result_positions]
-                # Take first self.digits positions (result digits are contiguous)
-                result_positions_b = result_positions_b[:self.digits]  # [digits]
-                
-                if len(result_positions_b) < self.digits:
-                    # Not enough result positions, skip this batch
-                    continue
-                
-                # Extract carry_probe logits at these positions
-                result_logits = outputs["carry_logits"][b, result_positions_b]  # [digits, 2]
-                carry_probe_logits_list.append(result_logits)
-                
-                # Extract corresponding carry labels (after CAR) - FIX: Use tensor indexing instead of .item()
-                carry_start = carry_start_positions[b].item()  # Only sync once per batch, not per operation
-                carry_end = carry_start + self.digits
-                carry_label_tokens = labels[b, carry_start:carry_end]  # [digits]
-                
-                # Convert token IDs to binary: digits 0-9 are tokens 2-11, so token - 2 gives digit value
-                # For carry, we only care about 0 or 1
-                carry_binary = torch.where(
-                    (carry_label_tokens >= 2) & (carry_label_tokens <= 11),  # Valid digit tokens
-                    carry_label_tokens - 2,  # Convert to digit value (0-9)
-                    IGNORE_LABEL_ID
-                )
-                # Clamp to {0, 1} since carries are binary
-                carry_binary = torch.clamp(carry_binary, 0, 1)
-                carry_binary_labels_list.append(carry_binary)
-            
-            if len(carry_probe_logits_list) > 0:
-                carry_probe_logits = torch.stack(carry_probe_logits_list, dim=0)  # [B_valid, digits, 2]
-                carry_binary_labels = torch.stack(carry_binary_labels_list, dim=0)  # [B_valid, digits]
-                
-                # Compute binary cross-entropy loss for carry probe
-                # Flatten: [B_valid * digits, 2] and [B_valid * digits]
-                carry_probe_logits_flat = carry_probe_logits.view(-1, 2)  # [B_valid * digits, 2]
-                carry_binary_labels_flat = carry_binary_labels.view(-1)  # [B_valid * digits]
-                valid_carry_mask_flat = (carry_binary_labels_flat != IGNORE_LABEL_ID)
-                
-                if valid_carry_mask_flat.any():
-                    carry_probe_loss = F.cross_entropy(
-                        carry_probe_logits_flat[valid_carry_mask_flat],
-                        carry_binary_labels_flat[valid_carry_mask_flat].long(),
-                        reduction="sum"
-                    ) / valid_carry_mask_flat.sum().clamp_min(1)
-                else:
-                    carry_probe_loss = torch.tensor(0.0, device=labels.device)
-                
-                # Carry accuracy metrics
-                with torch.no_grad():
-                    carry_probe_preds = torch.argmax(carry_probe_logits_flat, dim=-1)
-                    carry_correct = (carry_probe_preds == carry_binary_labels_flat) & valid_carry_mask_flat
-                    carry_accuracy = carry_correct.float().sum() / valid_carry_mask_flat.sum().clamp_min(1)
-                    metrics["carry_accuracy"] = carry_accuracy
-                    metrics["carry_probe_loss"] = carry_probe_loss.detach()
-            else:
-                # No valid batches, set loss to 0
-                carry_probe_loss = torch.tensor(0.0, device=labels.device)
-                metrics["carry_accuracy"] = torch.tensor(0.0, device=labels.device)
-                metrics["carry_probe_loss"] = carry_probe_loss
-            
-            # Total loss: L_y + λ * L_carry_probe
-            total_lm_loss = lm_loss + self.carry_loss_weight * carry_probe_loss
-        
-        # For lilavati3 during eval: no carry probe loss (only compute main loss)
-        elif self.dataset_mode == "lilavati3":
-            # Result mask: valid positions at or before CAR
-            if car_positions is not None:
-                result_mask = mask & (positions <= car_positions)
-            else:
-                result_mask = mask
-            result_counts = result_mask.sum(-1)
-            result_divisor = result_counts.clamp_min(1).unsqueeze(-1)
-            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=result_mask) / result_divisor).sum()
-            total_lm_loss = lm_loss
-        
         else:
-            # Vanilla / lilavati1: original behavior
+            # Vanilla / lilavati1 without labels_carry (evaluation): original behavior
             lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
             total_lm_loss = lm_loss
 
@@ -282,5 +246,8 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, total_lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        # Check if all sequences are halted
+        all_finish = new_carry.halted.all()
+        
+        return new_carry, total_lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, all_finish
 

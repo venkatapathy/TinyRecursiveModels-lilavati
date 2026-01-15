@@ -19,7 +19,7 @@ digits: 6
 # Hyperparams - Training
 global_batch_size: 256
 
-epochs: 10
+epochs: 100
 eval_interval: 1
 checkpoint_every_eval: False
 
@@ -42,6 +42,8 @@ min_eval_interval: 0
 project_name: "trm-lilavati"
 run_name: "lilavati2_trm_d6"
 
-# Lilavati2 specific: carry loss weight (can be tuned)
+# Lilavati2 specific: uses single head (lm_head) and single unified loss
+# Note: lilavati2 computes a single unified cross-entropy loss over the entire sequence
+# using only lm_head logits (predicts both result and carry positions with same head)
 arch:
-  carry_loss_weight: 1.0
+  carry_loss_weight: 1.0  # Not used in single-loss mode, but kept for compatibility

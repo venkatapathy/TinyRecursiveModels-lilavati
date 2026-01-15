@@ -31,6 +31,14 @@ class CastedSparseEmbedding(nn.Module):
             return self.weights[inputs].to(self.cast_to)
             
         # Training mode, fill puzzle embedding from weights
+        batch_size = inputs.shape[0]
+        if batch_size > self.local_weights.shape[0]:
+            # Batch size is larger than buffer (e.g., when concatenating batches)
+            # Create temporary tensors for this forward pass
+            # Note: gradients won't flow back to puzzle_emb in this case, but that's okay for concatenated batches
+            return self.weights[inputs].to(self.cast_to)
+        
+        # Normal case: batch size fits in buffer
         with torch.no_grad():
             self.local_weights.copy_(self.weights[inputs])
             self.local_ids.copy_(inputs)

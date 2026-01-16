@@ -15,14 +15,22 @@ class MultiplicationEvaluator:
         # 12: *
         # 13: =
         # 14: <CAR> (only for lilavati1)
+        # 15: <FACT> (only for lilavati1)
         self.vocab_map_inv = {i+2: str(i) for i in range(10)}
         self.vocab_map_inv[12] = '*'
         self.vocab_map_inv[13] = '='
-        if eval_metadata.vocab_size >= 15:  # Has lilavati1 tokens
+        if eval_metadata.vocab_size >= 16:  # Has lilavati1 tokens (<CAR> and <FACT>)
+            self.vocab_map_inv[14] = '<CAR>'
+            self.vocab_map_inv[15] = '<FACT>'
+            self.car_token_id = 14
+            self.fact_token_id = 15
+        elif eval_metadata.vocab_size >= 15:  # Legacy: only <CAR>
             self.vocab_map_inv[14] = '<CAR>'
             self.car_token_id = 14
+            self.fact_token_id = None
         else:
             self.car_token_id = None
+            self.fact_token_id = None
         self.vocab_map_inv[0] = 'PAD'
         self.vocab_map_inv[1] = 'MASK'
         
@@ -150,7 +158,9 @@ class MultiplicationEvaluator:
                         self.sequence_correct += 1
                 
                 elif self.dataset_mode == "lilavati1":
-                    # Lilavati1: format is "XXX*YYY=PPPPPP <CAR> CCCCCCCCC"
+                    # Lilavati1: format can be either:
+                    #   "XXX*YYY=PPPPPP <CAR> CCCCCCCCC" (carry trace)
+                    #   "XXX*YYY=PPPPPP <FACT> XXX*F1*F2" (factorization)
                     # Product is 2*digits after '='
                     max_result_digits = 2 * self.digits
                     result_start = eq_idx + 1
@@ -163,14 +173,20 @@ class MultiplicationEvaluator:
                     if '?' in result_str or 'PAD' in result_str or 'MASK' in result_str:
                         continue
                     
-                    # Find <CAR> token position (from input, not predictions, as model may not predict it yet)
-                    car_idx = None
+                    # Find special token position (<CAR> or <FACT>) from input
+                    special_token_idx = None
+                    special_token_type = None
                     for j in range(result_end, len(input_tokens)):
-                        if input_tokens[j] == self.car_token_id:
-                            car_idx = j
+                        if self.car_token_id is not None and input_tokens[j] == self.car_token_id:
+                            special_token_idx = j
+                            special_token_type = 'CAR'
+                            break
+                        elif self.fact_token_id is not None and input_tokens[j] == self.fact_token_id:
+                            special_token_idx = j
+                            special_token_type = 'FACT'
                             break
                     
-                    if car_idx is None:
+                    if special_token_idx is None:
                         continue
                     
                     # Parse predicted result
@@ -179,28 +195,58 @@ class MultiplicationEvaluator:
                     except ValueError:
                         continue
                     
-                    # Get carry predictions from same sequence (after CAR token, from lm_head)
-                    carry_trace_len = self.digits * self.digits
-                    carry_start = car_idx + 1
-                    carry_end = carry_start + carry_trace_len
-                    pred_carry_tokens = pred_seq[i, carry_start:carry_end]
-                    carry_str = self.decode(pred_carry_tokens)
+                    if special_token_type == 'FACT':
+                        # Handle factorization: extract factorized expression
+                        # Factorized expression format: "XXX*F1*F2"
+                        fact_start = special_token_idx + 1
+                        # Find where the factorized expression ends (look for end of sequence or next special token)
+                        fact_end = fact_start
+                        while fact_end < len(pred_seq[i]) and pred_seq[i, fact_end] not in [0, 1, 14, 15, 255]:  # Not PAD, MASK, CAR, FACT, IGNORE
+                            fact_end += 1
+                        
+                        pred_fact_tokens = pred_seq[i, fact_start:fact_end]
+                        fact_str = self.decode(pred_fact_tokens)
+                        
+                        if '?' not in fact_str and 'PAD' not in fact_str and 'MASK' not in fact_str:
+                            # Validate factorization: should be "a*f1*f2" where f1*f2 = b
+                            try:
+                                # Parse factorized expression
+                                parts = fact_str.split('*')
+                                if len(parts) == 3:
+                                    fact_a = int(parts[0])
+                                    fact_f1 = int(parts[1])
+                                    fact_f2 = int(parts[2])
+                                    
+                                    # Validate: fact_a should equal a, and fact_f1 * fact_f2 should equal b
+                                    if fact_a == a and fact_f1 * fact_f2 == b:
+                                        # Factorization is correct
+                                        pass  # Could track factorization accuracy here if needed
+                            except (ValueError, IndexError):
+                                pass  # Invalid factorization format
                     
-                    if '?' not in carry_str and 'PAD' not in carry_str and 'MASK' not in carry_str:
-                        # Compute expected carries
-                        expected_carries = self.compute_carry_trace(a, b)
-                        expected_carry_str = ''.join(str(c) for c in expected_carries)
+                    elif special_token_type == 'CAR':
+                        # Handle carry trace: existing logic
+                        carry_trace_len = self.digits * self.digits
+                        carry_start = special_token_idx + 1
+                        carry_end = carry_start + carry_trace_len
+                        pred_carry_tokens = pred_seq[i, carry_start:carry_end]
+                        carry_str = self.decode(pred_carry_tokens)
                         
-                        # Compute carry digit-level accuracy
-                        carry_matches = sum(1 for j in range(carry_trace_len)
-                                          if j < len(expected_carry_str) and j < len(carry_str)
-                                          and expected_carry_str[j] == carry_str[j])
-                        self.carry_correct += carry_matches
-                        self.carry_total += carry_trace_len
-                        
-                        # Compute carry sequence-level accuracy (all carry digits correct)
-                        if carry_matches == carry_trace_len:
-                            self.carry_sequence_correct += 1
+                        if '?' not in carry_str and 'PAD' not in carry_str and 'MASK' not in carry_str:
+                            # Compute expected carries
+                            expected_carries = self.compute_carry_trace(a, b)
+                            expected_carry_str = ''.join(str(c) for c in expected_carries)
+                            
+                            # Compute carry digit-level accuracy
+                            carry_matches = sum(1 for j in range(carry_trace_len)
+                                              if j < len(expected_carry_str) and j < len(carry_str)
+                                              and expected_carry_str[j] == carry_str[j])
+                            self.carry_correct += carry_matches
+                            self.carry_total += carry_trace_len
+                            
+                            # Compute carry sequence-level accuracy (all carry digits correct)
+                            if carry_matches == carry_trace_len:
+                                self.carry_sequence_correct += 1
                     
                     # Compute digit-level accuracy (for result digits only)
                     expected_res_str = f"{expected_res:0{max_result_digits}d}"
@@ -211,7 +257,7 @@ class MultiplicationEvaluator:
                                       and expected_res_str[j] == pred_res_str[j])
                     self.digit_correct += digit_matches
                     
-                    # Sequence-level accuracy (only result needs to be correct; carries are tracked separately)
+                    # Sequence-level accuracy (only result needs to be correct; carries/factorization tracked separately)
                     if pred_res == expected_res:
                         self.sequence_correct += 1
                 

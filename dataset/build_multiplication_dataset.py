@@ -36,6 +36,22 @@ def compute_carry_trace(a: int, b: int, digits: int) -> list:
     return carries  # Exactly digits*digits integers
 
 
+def find_factorization(b: int) -> Optional[tuple[int, int]]:
+    """
+    Find factorization of b into 2 single-digit factors (2-9), or None.
+    Returns (f1, f2) where b = f1 * f2 and f1 <= f2, or None if not possible.
+    Prefers smaller factors when multiple options exist (e.g., 8 = 2*4 preferred over 4*2).
+    """
+    if b < 4:  # 0,1,2,3 cannot be factorized into 2 factors >= 2
+        return None
+    for f1 in range(2, 10):
+        if b % f1 == 0:
+            f2 = b // f1
+            if 2 <= f2 <= 9:
+                return (min(f1, f2), max(f1, f2))  # Return in sorted order
+    return None
+
+
 class DataProcessConfig(BaseModel):
     output_dir: str = "data/multiplication"
     seed: int = 42
@@ -175,14 +191,17 @@ def main(config: DataProcessConfig):
     vocab_map['*'] = 12
     vocab_map['='] = 13
 
-    # For carry trace we need <CAR>
+    # For carry trace we need <CAR>, and for factorization we need <FACT>
     if config.dataset_mode == "lilavati1":
         vocab_map['<CAR>'] = 14
-        vocab_size = 15  # 0..14
+        vocab_map['<FACT>'] = 15
+        vocab_size = 16  # 0..15: PAD, MASK, 0-9, *, =, <CAR>, <FACT>
         CAR_TOKEN_ID = 14
+        FACT_TOKEN_ID = 15
     else:
         vocab_size = 14  # 0..13
         CAR_TOKEN_ID = None
+        FACT_TOKEN_ID = None
 
     PAD_ID = 0
     MASK_ID = 1
@@ -222,24 +241,46 @@ def main(config: DataProcessConfig):
                 inp_seq = prefix_ids + [MASK_ID] * prod_digits_fixed
                 lab_seq = [IGNORE_LABEL_ID] * len(prefix_ids) + encode_str(s_prod)
             else:
-                # carry trace
-                carries = compute_carry_trace(a, b, config.digits)
-                s_carries = ''.join(str(c) for c in carries)
-                assert len(s_carries) == carry_trace_len, f"Expected {carry_trace_len} carry digits, got {len(s_carries)}"
+                # Try factorization first, fallback to carry trace
+                factors = find_factorization(b)
+                if factors is not None:
+                    # Use factorization: product + <FACT> + factorized_expression
+                    f1, f2 = factors
+                    factorized_expr = s_a + "*" + str(f1) + "*" + str(f2)
+                    factorized_expr_ids = encode_str(factorized_expr)
+                    
+                    inp_seq = (
+                        prefix_ids
+                        + [MASK_ID] * prod_digits_fixed
+                        + [FACT_TOKEN_ID]
+                        + [MASK_ID] * len(factorized_expr_ids)
+                    )
+                    lab_seq = (
+                        [IGNORE_LABEL_ID] * len(prefix_ids)
+                        + encode_str(s_prod)
+                        + [FACT_TOKEN_ID]
+                        + factorized_expr_ids
+                    )
+                    assert lab_seq.count(FACT_TOKEN_ID) == 1
+                else:
+                    # Use carry trace
+                    carries = compute_carry_trace(a, b, config.digits)
+                    s_carries = ''.join(str(c) for c in carries)
+                    assert len(s_carries) == carry_trace_len, f"Expected {carry_trace_len} carry digits, got {len(s_carries)}"
 
-                inp_seq = (
-                    prefix_ids
-                    + [MASK_ID] * prod_digits_fixed
-                    + [CAR_TOKEN_ID]
-                    + [MASK_ID] * carry_trace_len
-                )
-                lab_seq = (
-                    [IGNORE_LABEL_ID] * len(prefix_ids)
-                    + encode_str(s_prod)
-                    + [CAR_TOKEN_ID]
-                    + encode_str(s_carries)
-                )
-                assert lab_seq.count(CAR_TOKEN_ID) == 1
+                    inp_seq = (
+                        prefix_ids
+                        + [MASK_ID] * prod_digits_fixed
+                        + [CAR_TOKEN_ID]
+                        + [MASK_ID] * carry_trace_len
+                    )
+                    lab_seq = (
+                        [IGNORE_LABEL_ID] * len(prefix_ids)
+                        + encode_str(s_prod)
+                        + [CAR_TOKEN_ID]
+                        + encode_str(s_carries)
+                    )
+                    assert lab_seq.count(CAR_TOKEN_ID) == 1
 
             assert len(inp_seq) == len(lab_seq)
             inputs.append(inp_seq)
@@ -345,12 +386,19 @@ def generate_dataset_stats(
     # basic stats
     products = []
     all_carries = []
+    factorization_count = 0
+    carry_trace_count = 0
     for split_name, pairs in splits.items():
         for a, b in pairs:
             products.append(a * b)
             if config.dataset_mode == "lilavati1":
-                carries = compute_carry_trace(a, b, config.digits)
-                all_carries.extend(carries)
+                factors = find_factorization(b)
+                if factors is not None:
+                    factorization_count += 1
+                else:
+                    carry_trace_count += 1
+                    carries = compute_carry_trace(a, b, config.digits)
+                    all_carries.extend(carries)
 
     prod_counter = Counter(len(str(p)) for p in products)
 
@@ -363,6 +411,7 @@ def generate_dataset_stats(
     vocab_desc.append("- `13`: '='")
     if config.dataset_mode == "lilavati1":
         vocab_desc.append("- `14`: '<CAR>'")
+        vocab_desc.append("- `15`: '<FACT>'")
 
     # sample examples
     def show_example(a, b):
@@ -375,9 +424,15 @@ def generate_dataset_stats(
         if config.dataset_mode == "vanilla":
             return f"`{s_a}*{s_b}={s_p}`"
         else:
-            carries = compute_carry_trace(a, b, config.digits)
-            s_carries = ''.join(str(c) for c in carries)
-            return f"`{s_a}*{s_b}={s_p} <CAR> {s_carries}`"
+            factors = find_factorization(b)
+            if factors is not None:
+                f1, f2 = factors
+                factorized_expr = s_a + "*" + str(f1) + "*" + str(f2)
+                return f"`{s_a}*{s_b}={s_p} <FACT> {factorized_expr}`"
+            else:
+                carries = compute_carry_trace(a, b, config.digits)
+                s_carries = ''.join(str(c) for c in carries)
+                return f"`{s_a}*{s_b}={s_p} <CAR> {s_carries}`"
 
     train_sample = splits["train"][:5]
     test_sample = splits["test"][:3]
@@ -398,6 +453,7 @@ def generate_dataset_stats(
         readme.append(f"- **Train Max Digits**: {config.train_max_digits} (test includes OOD > {config.train_max_digits})")
     if config.dataset_mode == "lilavati1":
         readme.append(f"- **Carry Trace Length**: {carry_trace_len} digits (digits*digits = {config.digits}*{config.digits})")
+        readme.append(f"- **Factorization**: Uses <FACT> when multiplier can be factorized into 2 single-digit factors (2-9), otherwise uses <CAR>")
 
     readme.append("\n### Dataset Statistics")
     readme.append(f"- **Total Examples**: {total_examples:,}")
@@ -408,13 +464,20 @@ def generate_dataset_stats(
     readme.append(f"- **Product Digits (padded)**: {prod_digits_fixed} (since max is < 10^(2*digits))")
     readme.append(f"- **Product digit-count distribution (raw, before padding)**: {dict(sorted(prod_counter.items()))}")
 
-    if config.dataset_mode == "lilavati1" and all_carries:
-        carry_counter = Counter(all_carries)
-        readme.append("\n### Carry Distribution Statistics")
-        readme.append(f"- **Total Carry Predictions**: {len(all_carries):,}")
-        for carry_val in sorted(carry_counter.keys()):
-            count = carry_counter[carry_val]
-            readme.append(f"- **Carry = {carry_val}**: {count:,} ({count/len(all_carries)*100:.1f}%)")
+    if config.dataset_mode == "lilavati1":
+        total_lilavati = factorization_count + carry_trace_count
+        if total_lilavati > 0:
+            readme.append("\n### Factorization vs Carry Trace Statistics")
+            readme.append(f"- **Examples using <FACT> (factorization)**: {factorization_count:,} ({factorization_count/total_lilavati*100:.1f}%)")
+            readme.append(f"- **Examples using <CAR> (carry trace)**: {carry_trace_count:,} ({carry_trace_count/total_lilavati*100:.1f}%)")
+        
+        if all_carries:
+            carry_counter = Counter(all_carries)
+            readme.append("\n### Carry Distribution Statistics (for <CAR> examples)")
+            readme.append(f"- **Total Carry Predictions**: {len(all_carries):,}")
+            for carry_val in sorted(carry_counter.keys()):
+                count = carry_counter[carry_val]
+                readme.append(f"- **Carry = {carry_val}**: {count:,} ({count/len(all_carries)*100:.1f}%)")
 
     readme.append("\n## Format Specification\n")
     readme.append("### Input Format")
@@ -426,7 +489,9 @@ def generate_dataset_stats(
     if config.dataset_mode == "vanilla":
         readme.append(f"- `{('P'*prod_digits_fixed)}` (product, padded to {prod_digits_fixed} digits)")
     else:
-        readme.append(f"- `{('P'*prod_digits_fixed)} <CAR> {('C'*carry_trace_len)}`")
+        readme.append(f"- **With factorization** (when multiplier can be factorized): `{('P'*prod_digits_fixed)} <FACT> XXX*F1*F2`")
+        readme.append(f"  - Example: `145*8=001160 <FACT> 145*2*4`")
+        readme.append(f"- **With carry trace** (when factorization not possible): `{('P'*prod_digits_fixed)} <CAR> {('C'*carry_trace_len)}`")
         readme.append(f"  - Carry trace = {carry_trace_len} digits (digits*digits = {config.digits}*{config.digits})")
         readme.append(f"  - Each carry digit is in [0..8] (from long multiplication partial products)")
 

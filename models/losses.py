@@ -39,7 +39,8 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 CAR_TOKEN_ID = 14  # <CAR> token for addition lilavati modes
-AVY_TOKEN_ID = 16  # <AVY> token for multiplication lilavati modes
+AVY_TOKEN_ID = 16  # <AVY> token for multiplication lilavati modes (legacy)
+FACT_TOKEN_ID = 15  # <FACT> token for multiplication factorization
 
 
 class ACTLossHead(nn.Module):
@@ -72,20 +73,22 @@ class ACTLossHead(nn.Module):
             batch_size, seq_len = labels.shape
             positions = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
             
-            # Detect special token: <CAR> (14) for addition and multiplication
+            # Detect special token: <CAR> (14) for addition and multiplication, <FACT> (15) for factorization
             # Also check for <AVY> (16) for backward compatibility with old multiplication datasets
             car_mask_inputs = (inputs == CAR_TOKEN_ID)  # <CAR> token (used for both addition and multiplication)
+            fact_mask_inputs = (inputs == FACT_TOKEN_ID)  # <FACT> token (for multiplication factorization)
             avy_mask_inputs = (inputs == AVY_TOKEN_ID)  # <AVY> token (legacy, for old multiplication datasets)
-            special_token_mask_inputs = car_mask_inputs | avy_mask_inputs
+            special_token_mask_inputs = car_mask_inputs | fact_mask_inputs | avy_mask_inputs
             
             car_mask_labels = (labels == CAR_TOKEN_ID)
+            fact_mask_labels = (labels == FACT_TOKEN_ID)
             avy_mask_labels = (labels == AVY_TOKEN_ID)
-            special_token_mask_labels = car_mask_labels | avy_mask_labels
+            special_token_mask_labels = car_mask_labels | fact_mask_labels | avy_mask_labels
             
-            # Create position indices (use whichever token is found)
+            # Create position indices (use whichever token is found: CAR, FACT, or AVY)
             car_positions = special_token_mask_inputs.float().argmax(dim=-1, keepdim=True)  # [B, 1]
             
-            # Carry mask: positions after special token (CAR or AVY)
+            # Carry/factorization mask: positions after special token (CAR, FACT, or AVY)
             carry_pos_mask = (positions > car_positions)
             
             if self.dataset_mode in {"lilavati1", "lilavati2"}:

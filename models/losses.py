@@ -38,7 +38,8 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
 
 
-CAR_TOKEN_ID = 14  # <CAR> token for lilavati modes
+CAR_TOKEN_ID = 14  # <CAR> token for addition lilavati modes
+AVY_TOKEN_ID = 16  # <AVY> token for multiplication lilavati modes
 
 
 class ACTLossHead(nn.Module):
@@ -65,20 +66,26 @@ class ACTLossHead(nn.Module):
         labels_carry = new_carry.current_data.get("labels_carry", None)  # From lilavati dataset
 
         # For lilavati1/lilavati2/lilavati3: need to compute masks before predictions
-        # lilavati1 now uses same format as lilavati3 (single sequence with CAR token)
+        # lilavati1 now uses same format as lilavati3 (single sequence with CAR/AVY token)
         if self.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
             inputs = new_carry.current_data["inputs"]
             batch_size, seq_len = labels.shape
             positions = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
             
-            # Find CAR token positions from INPUTS (not labels, as labels may be dummy during inference)
-            car_mask_inputs = (inputs == CAR_TOKEN_ID)
+            # Detect special token: <CAR> (14) for addition and multiplication
+            # Also check for <AVY> (16) for backward compatibility with old multiplication datasets
+            car_mask_inputs = (inputs == CAR_TOKEN_ID)  # <CAR> token (used for both addition and multiplication)
+            avy_mask_inputs = (inputs == AVY_TOKEN_ID)  # <AVY> token (legacy, for old multiplication datasets)
+            special_token_mask_inputs = car_mask_inputs | avy_mask_inputs
+            
             car_mask_labels = (labels == CAR_TOKEN_ID)
+            avy_mask_labels = (labels == AVY_TOKEN_ID)
+            special_token_mask_labels = car_mask_labels | avy_mask_labels
             
-            # Create position indices
-            car_positions = car_mask_inputs.float().argmax(dim=-1, keepdim=True)  # [B, 1]
+            # Create position indices (use whichever token is found)
+            car_positions = special_token_mask_inputs.float().argmax(dim=-1, keepdim=True)  # [B, 1]
             
-            # Carry mask: positions after CAR
+            # Carry mask: positions after special token (CAR or AVY)
             carry_pos_mask = (positions > car_positions)
             
             if self.dataset_mode in {"lilavati1", "lilavati2"}:

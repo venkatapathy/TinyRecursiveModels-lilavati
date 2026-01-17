@@ -58,7 +58,7 @@ class DataProcessConfig(BaseModel):
     test_ratio: float = 0.1
 
     digits: int = 3  # max digits per operand if varied_length=False (e.g., 3 => 000..999)
-    dataset_mode: str = "vanilla"  # "vanilla" or "lilavati1"
+    dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", "lilavati1_fact_only", "lilavati2", or "lilavati2_fact_only"
 
     # Sampling controls (same semantics as your addition script)
     max_examples: Optional[int] = None        # target TRAIN examples after filtering
@@ -72,8 +72,8 @@ class DataProcessConfig(BaseModel):
 
 @cli.command(singleton=True)
 def main(config: DataProcessConfig):
-    assert config.dataset_mode in {"vanilla", "lilavati1"}, \
-        f"dataset_mode must be 'vanilla' or 'lilavati1', got {config.dataset_mode}"
+    assert config.dataset_mode in {"vanilla", "lilavati1", "lilavati1_fact_only", "lilavati2", "lilavati2_fact_only"}, \
+        f"dataset_mode must be 'vanilla', 'lilavati1', 'lilavati1_fact_only', 'lilavati2', or 'lilavati2_fact_only', got {config.dataset_mode}"
     assert config.digits >= 1, f"digits must be >= 1, got {config.digits}"
     assert config.sample_ratio is None or 0.0 < config.sample_ratio <= 1.0, \
         f"sample_ratio must be in (0,1], got {config.sample_ratio}"
@@ -177,6 +177,69 @@ def main(config: DataProcessConfig):
         train_pairs = pairs[:split_idx]
         test_pairs = pairs[split_idx:]
 
+        # Generate OOD pairs with config.digits + 1 and config.digits + 2 digits
+        print(f"Generating OOD pairs with {config.digits + 1} and {config.digits + 2} digit operands...")
+        ood_pairs = []
+        rng_ood = np.random.default_rng(config.seed + 1)  # Different seed for OOD generation
+        
+        # Generate OOD pairs with config.digits + 1 digits
+        ood_max_val_1 = 10 ** (config.digits + 1) - 1
+        ood_total_1 = (ood_max_val_1 + 1) ** 2
+        # Sample a reasonable number of pairs (e.g., 10% of total, but cap at reasonable size)
+        ood_sample_size_1 = min(int(ood_total_1 * 0.1), 1000000)  # Cap at 1M for memory
+        ood_indices_1 = rng_ood.choice(ood_total_1, size=ood_sample_size_1, replace=False)
+        for idx in ood_indices_1:
+            a = int(idx // (ood_max_val_1 + 1))
+            b = int(idx % (ood_max_val_1 + 1))
+            max_digits = max(len(str(a)), len(str(b)))
+            if max_digits == config.digits + 1:  # Only keep pairs with exactly config.digits + 1 digits
+                ood_pairs.append((a, b))
+        
+        # Generate OOD pairs with config.digits + 2 digits
+        ood_max_val_2 = 10 ** (config.digits + 2) - 1
+        ood_total_2 = (ood_max_val_2 + 1) ** 2
+        # Sample a reasonable number of pairs
+        ood_sample_size_2 = min(int(ood_total_2 * 0.01), 1000000)  # Smaller sample for larger numbers
+        ood_indices_2 = rng_ood.choice(ood_total_2, size=ood_sample_size_2, replace=False)
+        for idx in ood_indices_2:
+            a = int(idx // (ood_max_val_2 + 1))
+            b = int(idx % (ood_max_val_2 + 1))
+            max_digits = max(len(str(a)), len(str(b)))
+            if max_digits == config.digits + 2:  # Only keep pairs with exactly config.digits + 2 digits
+                ood_pairs.append((a, b))
+        
+        # Group OOD pairs by their max digit length
+        ood_by_digits = defaultdict(list)
+        for a, b in ood_pairs:
+            max_digits = max(len(str(a)), len(str(b)))
+            ood_by_digits[max_digits].append((a, b))
+        
+        print(f"OOD pairs by digit length: {dict((k, len(v)) for k, v in sorted(ood_by_digits.items()))}")
+        
+        # Sample OOD pairs to add to test, ensuring equal distribution across OOD digit lengths
+        if len(ood_by_digits) > 0:
+            # Calculate how many OOD examples we want in test
+            # Target: 20% of in-distribution test examples (reasonable for smaller datasets)
+            # Cap at 5,000 to avoid excessive OOD examples
+            target_ood_test = min(int(len(test_pairs) * 0.2), 5000)
+            num_ood_digit_lengths = len(ood_by_digits)
+            
+            if num_ood_digit_lengths > 0:
+                # Distribute equally across all OOD digit lengths
+                per_digit_length = max(1, target_ood_test // num_ood_digit_lengths)
+                sampled_ood = []
+                
+                for digit_len in sorted(ood_by_digits.keys()):
+                    pairs_for_length = ood_by_digits[digit_len]
+                    np.random.shuffle(pairs_for_length)
+                    sample_count = min(per_digit_length, len(pairs_for_length))
+                    sampled_ood.extend(pairs_for_length[:sample_count])
+                    print(f"  Sampled {sample_count:,} OOD pairs with {digit_len} digits for test")
+                
+                test_pairs.extend(sampled_ood)
+                print(f"Split in-distribution pairs: {len(train_pairs):,} train, {len(test_pairs) - len(sampled_ood):,} in-distribution test")
+                print(f"Added {len(sampled_ood):,} OOD pairs (>{config.digits} digits) to test (final test size: {len(test_pairs):,})")
+
     splits = {"train": train_pairs, "test": test_pairs}
 
     # -------------------------
@@ -192,12 +255,33 @@ def main(config: DataProcessConfig):
     vocab_map['='] = 13
 
     # For carry trace we need <CAR>, and for factorization we need <FACT>
-    if config.dataset_mode == "lilavati1":
-        vocab_map['<CAR>'] = 14
-        vocab_map['<FACT>'] = 15
-        vocab_size = 16  # 0..15: PAD, MASK, 0-9, *, =, <CAR>, <FACT>
-        CAR_TOKEN_ID = 14
-        FACT_TOKEN_ID = 15
+    if config.dataset_mode in {"lilavati1", "lilavati1_fact_only", "lilavati2", "lilavati2_fact_only"}:
+        if config.dataset_mode == "lilavati1_fact_only":
+            # FACT-only mode: only <FACT> token, no <CAR>
+            vocab_map['<FACT>'] = 14
+            vocab_size = 15  # 0..14: PAD, MASK, 0-9, *, =, <FACT>
+            CAR_TOKEN_ID = None
+            FACT_TOKEN_ID = 14
+        elif config.dataset_mode == "lilavati2_fact_only":
+            # Lilavati2_fact_only: only <FACT> token, no <CAR> (same vocab as lilavati1_fact_only)
+            vocab_map['<FACT>'] = 14
+            vocab_size = 15  # 0..14: PAD, MASK, 0-9, *, =, <FACT>
+            CAR_TOKEN_ID = None
+            FACT_TOKEN_ID = 14
+        elif config.dataset_mode == "lilavati2":
+            # Lilavati2: both <CAR> and <FACT> tokens (like lilavati1, but with unified loss)
+            vocab_map['<CAR>'] = 14
+            vocab_map['<FACT>'] = 15
+            vocab_size = 16  # 0..15: PAD, MASK, 0-9, *, =, <CAR>, <FACT>
+            CAR_TOKEN_ID = 14
+            FACT_TOKEN_ID = 15
+        else:
+            # Regular lilavati1: both <CAR> and <FACT>
+            vocab_map['<CAR>'] = 14
+            vocab_map['<FACT>'] = 15
+            vocab_size = 16  # 0..15: PAD, MASK, 0-9, *, =, <CAR>, <FACT>
+            CAR_TOKEN_ID = 14
+            FACT_TOKEN_ID = 15
     else:
         vocab_size = 14  # 0..13
         CAR_TOKEN_ID = None
@@ -224,24 +308,79 @@ def main(config: DataProcessConfig):
         for (a, b) in current_pairs:
             prod = a * b
 
+            # Calculate actual max digit length for this pair (handles OOD examples)
+            actual_max_digits = max(len(str(a)), len(str(b)))
+            # Use actual_max_digits for OOD examples, config.digits for in-distribution
+            effective_digits = actual_max_digits if actual_max_digits > config.digits else config.digits
+            
+            # Calculate product digits and carry trace length based on effective digits
+            # For OOD examples, use actual_max_digits; for in-distribution, use config.digits
+            prod_digits_this = 2 * effective_digits
+            carry_trace_len_this = effective_digits * effective_digits
+
             if config.varied_length:
                 s_a = str(a)
                 s_b = str(b)
             else:
-                s_a = f"{a:0{config.digits}d}"
-                s_b = f"{b:0{config.digits}d}"
+                # For in-distribution examples (actual_max_digits <= config.digits), pad to config.digits
+                # For OOD examples (actual_max_digits > config.digits), pad to actual_max_digits
+                if actual_max_digits <= config.digits:
+                    pad_digits = config.digits
+                else:
+                    pad_digits = actual_max_digits
+                s_a = f"{a:0{pad_digits}d}"
+                s_b = f"{b:0{pad_digits}d}"
 
-            # Always pad product to 2*digits so sequence length is stable (like addition digits+1).
-            s_prod = f"{prod:0{prod_digits_fixed}d}"
+            # Pad product based on effective digits
+            s_prod = f"{prod:0{prod_digits_this}d}"
 
             prefix = s_a + "*" + s_b + "="
             prefix_ids = encode_str(prefix)
 
             if config.dataset_mode == "vanilla":
-                inp_seq = prefix_ids + [MASK_ID] * prod_digits_fixed
+                inp_seq = prefix_ids + [MASK_ID] * prod_digits_this
                 lab_seq = [IGNORE_LABEL_ID] * len(prefix_ids) + encode_str(s_prod)
-            else:
+            elif config.dataset_mode in {"lilavati1_fact_only", "lilavati2_fact_only"}:
+                # FACT-only mode: same datapoints as vanilla, but add <FACT> + factorization when available
+                factors = find_factorization(b)
+                if factors is not None:
+                    # Add factorization: product + <FACT> + factorized_expression
+                    f1, f2 = factors
+                    factorized_expr = s_a + "*" + str(f1) + "*" + str(f2)
+                    factorized_expr_ids = encode_str(factorized_expr)
+                    
+                    inp_seq = (
+                        prefix_ids
+                        + [MASK_ID] * prod_digits_this
+                        + [FACT_TOKEN_ID]
+                        + [MASK_ID] * len(factorized_expr_ids)
+                    )
+                    if config.dataset_mode == "lilavati2_fact_only":
+                        # Lilavati2_fact_only: FACT token included in labels (for unified loss, like lilavati2)
+                        lab_seq = (
+                            [IGNORE_LABEL_ID] * len(prefix_ids)
+                            + encode_str(s_prod)
+                            + [FACT_TOKEN_ID]  # FACT token: included in unified loss
+                            + factorized_expr_ids
+                        )
+                        assert lab_seq.count(FACT_TOKEN_ID) == 1
+                    else:
+                        # Lilavati1_fact_only: FACT token excluded from labels (for separate losses)
+                        lab_seq = (
+                            [IGNORE_LABEL_ID] * len(prefix_ids)
+                            + encode_str(s_prod)
+                            + [IGNORE_LABEL_ID]  # FACT token: excluded from loss (model sees it in input but doesn't predict it)
+                            + factorized_expr_ids
+                        )
+                        # FACT token is IGNORE_LABEL_ID in labels, so no need to assert its presence
+                else:
+                    # No factorization available: just product (like vanilla)
+                    inp_seq = prefix_ids + [MASK_ID] * prod_digits_this
+                    lab_seq = [IGNORE_LABEL_ID] * len(prefix_ids) + encode_str(s_prod)
+            else:  # lilavati1 or lilavati2
                 # Try factorization first, fallback to carry trace
+                # Both lilavati1 and lilavati2 use the same data format (both CAR and FACT tokens)
+                # The difference is only in the loss computation (lilavati1 has separate losses, lilavati2 has unified loss)
                 factors = find_factorization(b)
                 if factors is not None:
                     # Use factorization: product + <FACT> + factorized_expression
@@ -251,7 +390,7 @@ def main(config: DataProcessConfig):
                     
                     inp_seq = (
                         prefix_ids
-                        + [MASK_ID] * prod_digits_fixed
+                        + [MASK_ID] * prod_digits_this
                         + [FACT_TOKEN_ID]
                         + [MASK_ID] * len(factorized_expr_ids)
                     )
@@ -263,16 +402,16 @@ def main(config: DataProcessConfig):
                     )
                     assert lab_seq.count(FACT_TOKEN_ID) == 1
                 else:
-                    # Use carry trace
-                    carries = compute_carry_trace(a, b, config.digits)
+                    # Use carry trace - use effective_digits for OOD examples
+                    carries = compute_carry_trace(a, b, effective_digits)
                     s_carries = ''.join(str(c) for c in carries)
-                    assert len(s_carries) == carry_trace_len, f"Expected {carry_trace_len} carry digits, got {len(s_carries)}"
+                    assert len(s_carries) == carry_trace_len_this, f"Expected {carry_trace_len_this} carry digits, got {len(s_carries)}"
 
                     inp_seq = (
                         prefix_ids
-                        + [MASK_ID] * prod_digits_fixed
+                        + [MASK_ID] * prod_digits_this
                         + [CAR_TOKEN_ID]
-                        + [MASK_ID] * carry_trace_len
+                        + [MASK_ID] * carry_trace_len_this
                     )
                     lab_seq = (
                         [IGNORE_LABEL_ID] * len(prefix_ids)
@@ -399,6 +538,13 @@ def generate_dataset_stats(
                     carry_trace_count += 1
                     carries = compute_carry_trace(a, b, config.digits)
                     all_carries.extend(carries)
+            elif config.dataset_mode == "lilavati1_fact_only":
+                factors = find_factorization(b)
+                if factors is not None:
+                    factorization_count += 1
+                else:
+                    # No factorization, but example is still included (like vanilla)
+                    pass
 
     prod_counter = Counter(len(str(p)) for p in products)
 
@@ -412,6 +558,8 @@ def generate_dataset_stats(
     if config.dataset_mode == "lilavati1":
         vocab_desc.append("- `14`: '<CAR>'")
         vocab_desc.append("- `15`: '<FACT>'")
+    elif config.dataset_mode == "lilavati1_fact_only":
+        vocab_desc.append("- `14`: '<FACT>'")
 
     # sample examples
     def show_example(a, b):
@@ -423,7 +571,16 @@ def generate_dataset_stats(
         s_p = f"{p:0{prod_digits_fixed}d}"
         if config.dataset_mode == "vanilla":
             return f"`{s_a}*{s_b}={s_p}`"
-        else:
+        elif config.dataset_mode == "lilavati1_fact_only":
+            # FACT-only mode: show factorization if available, otherwise vanilla format
+            factors = find_factorization(b)
+            if factors is not None:
+                f1, f2 = factors
+                factorized_expr = s_a + "*" + str(f1) + "*" + str(f2)
+                return f"`{s_a}*{s_b}={s_p} <FACT> {factorized_expr}`"
+            else:
+                return f"`{s_a}*{s_b}={s_p}` (vanilla format, no factorization)"
+        else:  # lilavati1
             factors = find_factorization(b)
             if factors is not None:
                 f1, f2 = factors
@@ -454,6 +611,10 @@ def generate_dataset_stats(
     if config.dataset_mode == "lilavati1":
         readme.append(f"- **Carry Trace Length**: {carry_trace_len} digits (digits*digits = {config.digits}*{config.digits})")
         readme.append(f"- **Factorization**: Uses <FACT> when multiplier can be factorized into 2 single-digit factors (2-9), otherwise uses <CAR>")
+    elif config.dataset_mode == "lilavati1_fact_only":
+        readme.append(f"- **FACT-only mode**: Same datapoints as vanilla, but adds <FACT> + factorization when available")
+        readme.append(f"- **Examples with factorization**: {factorization_count:,} (add <FACT> + factorization)")
+        readme.append(f"- **Examples without factorization**: {total_examples - factorization_count:,} (vanilla format, product only)")
 
     readme.append("\n### Dataset Statistics")
     readme.append(f"- **Total Examples**: {total_examples:,}")
@@ -478,6 +639,10 @@ def generate_dataset_stats(
             for carry_val in sorted(carry_counter.keys()):
                 count = carry_counter[carry_val]
                 readme.append(f"- **Carry = {carry_val}**: {count:,} ({count/len(all_carries)*100:.1f}%)")
+    elif config.dataset_mode == "lilavati1_fact_only":
+        readme.append("\n### Factorization Statistics")
+        readme.append(f"- **Examples using <FACT> (factorization)**: {factorization_count:,} ({factorization_count/total_examples*100:.1f}%)")
+        readme.append(f"- **Examples without factorization (vanilla format)**: {total_examples - factorization_count:,} ({(total_examples - factorization_count)/total_examples*100:.1f}%)")
 
     readme.append("\n## Format Specification\n")
     readme.append("### Input Format")
@@ -488,7 +653,13 @@ def generate_dataset_stats(
     readme.append("\n### Output Format")
     if config.dataset_mode == "vanilla":
         readme.append(f"- `{('P'*prod_digits_fixed)}` (product, padded to {prod_digits_fixed} digits)")
-    else:
+    elif config.dataset_mode == "lilavati1_fact_only":
+        readme.append(f"- **With factorization** (when available): `{('P'*prod_digits_fixed)} <FACT> XXX*F1*F2`")
+        readme.append(f"  - Example: `145*8=001160 <FACT> 145*2*4`")
+        readme.append(f"- **Without factorization** (when not available): `{('P'*prod_digits_fixed)}` (vanilla format)")
+        readme.append(f"  - Example: `145*7=001015` (no <FACT> token)")
+        readme.append(f"  - Same datapoints as vanilla, but adds factorization info when possible")
+    else:  # lilavati1
         readme.append(f"- **With factorization** (when multiplier can be factorized): `{('P'*prod_digits_fixed)} <FACT> XXX*F1*F2`")
         readme.append(f"  - Example: `145*8=001160 <FACT> 145*2*4`")
         readme.append(f"- **With carry trace** (when factorization not possible): `{('P'*prod_digits_fixed)} <CAR> {('C'*carry_trace_len)}`")

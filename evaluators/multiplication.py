@@ -34,7 +34,7 @@ class MultiplicationEvaluator:
         self.vocab_map_inv[0] = 'PAD'
         self.vocab_map_inv[1] = 'MASK'
         
-        assert dataset_mode in {"vanilla", "lilavati1"}, f"dataset_mode must be 'vanilla' or 'lilavati1', got {dataset_mode}"
+        assert dataset_mode in {"vanilla", "lilavati1", "lilavati1_fact_only", "lilavati2", "lilavati2_fact_only"}, f"dataset_mode must be 'vanilla', 'lilavati1', 'lilavati1_fact_only', 'lilavati2', or 'lilavati2_fact_only', got {dataset_mode}"
         self.dataset_mode = dataset_mode
         self.digits = digits
         
@@ -42,8 +42,13 @@ class MultiplicationEvaluator:
         self.required_outputs = {"inputs", "preds"}
         
         # Validate dataset mode matches vocabulary
-        if dataset_mode == "lilavati1":
-            assert eval_metadata.vocab_size >= 15, f"Lilavati1 mode requires vocab_size >= 15 (to include <CAR> token), got {eval_metadata.vocab_size}"
+        if dataset_mode in {"lilavati1", "lilavati1_fact_only", "lilavati2", "lilavati2_fact_only"}:
+            if dataset_mode in {"lilavati1_fact_only", "lilavati2_fact_only"}:
+                assert eval_metadata.vocab_size >= 15, f"{dataset_mode} mode requires vocab_size >= 15 (to include <FACT> token), got {eval_metadata.vocab_size}"
+            elif dataset_mode == "lilavati2":
+                assert eval_metadata.vocab_size >= 15, f"Lilavati2 mode requires vocab_size >= 15 (to include <CAR> token), got {eval_metadata.vocab_size}"
+            else:
+                assert eval_metadata.vocab_size >= 15, f"Lilavati1 mode requires vocab_size >= 15 (to include <CAR> token), got {eval_metadata.vocab_size}"
         
         self.total = 0
         self.digit_correct = 0  # Digit-level accuracy for result
@@ -157,7 +162,7 @@ class MultiplicationEvaluator:
                     if pred_res == expected_res:
                         self.sequence_correct += 1
                 
-                elif self.dataset_mode == "lilavati1":
+                elif self.dataset_mode in {"lilavati1", "lilavati1_fact_only", "lilavati2_fact_only"}:
                     # Lilavati1: format can be either:
                     #   "XXX*YYY=PPPPPP <CAR> CCCCCCCCC" (carry trace)
                     #   "XXX*YYY=PPPPPP <FACT> XXX*F1*F2" (factorization)
@@ -261,6 +266,181 @@ class MultiplicationEvaluator:
                     if pred_res == expected_res:
                         self.sequence_correct += 1
                 
+                elif self.dataset_mode == "lilavati2":
+                    # Lilavati2: format can be either:
+                    #   "XXX*YYY=PPPPPP <CAR> CCCCCCCCC" (carry trace)
+                    #   "XXX*YYY=PPPPPP <FACT> XXX*F1*F2" (factorization)
+                    # Uses unified loss (same format as lilavati1, but different loss computation)
+                    # Product is 2*digits after '='
+                    max_result_digits = 2 * self.digits
+                    result_start = eq_idx + 1
+                    result_end = result_start + max_result_digits
+                    
+                    pred_result_tokens = pred_seq[i, result_start:result_end]
+                    result_str = self.decode(pred_result_tokens)
+                    
+                    # Check for invalid tokens in result
+                    if '?' in result_str or 'PAD' in result_str or 'MASK' in result_str:
+                        continue
+                    
+                    # Find special token (<CAR> or <FACT>) from input (not predictions, as model may not predict it yet)
+                    special_token_idx = None
+                    special_token_type = None
+                    for j in range(result_end, len(input_tokens)):
+                        if self.car_token_id is not None and input_tokens[j] == self.car_token_id:
+                            special_token_idx = j
+                            special_token_type = 'CAR'
+                            break
+                        elif self.fact_token_id is not None and input_tokens[j] == self.fact_token_id:
+                            special_token_idx = j
+                            special_token_type = 'FACT'
+                            break
+                    
+                    if special_token_idx is None:
+                        continue
+                    
+                    # Parse predicted result
+                    try:
+                        pred_res = int(result_str)
+                    except ValueError:
+                        continue
+                    
+                    # Handle CAR token (carry trace) or FACT token (factorization)
+                    if special_token_type == 'CAR':
+                        # Get carry predictions from same sequence (after CAR token)
+                        carry_trace_len = self.digits * self.digits
+                        carry_start = special_token_idx + 1
+                        carry_end = carry_start + carry_trace_len
+                        pred_carry_tokens = pred_seq[i, carry_start:carry_end]
+                        carry_str = self.decode(pred_carry_tokens)
+                        
+                        if '?' not in carry_str and 'PAD' not in carry_str and 'MASK' not in carry_str:
+                            # Compute expected carries
+                            expected_carries = self.compute_carry_trace(a, b)
+                            expected_carry_str = ''.join(str(c) for c in expected_carries)
+                            
+                            # Compute carry digit-level accuracy
+                            carry_matches = sum(1 for j in range(carry_trace_len)
+                                              if j < len(expected_carry_str) and j < len(carry_str)
+                                              and expected_carry_str[j] == carry_str[j])
+                            self.carry_correct += carry_matches
+                            self.carry_total += carry_trace_len
+                    elif special_token_type == 'FACT':
+                        # Handle factorization: extract factorized expression
+                        fact_start = special_token_idx + 1
+                        # Find where the factorized expression ends
+                        fact_end = fact_start
+                        while fact_end < len(pred_seq[i]) and pred_seq[i, fact_end] not in [0, 1, 14, 15, 255]:  # Not PAD, MASK, CAR, FACT, IGNORE
+                            fact_end += 1
+                        
+                        pred_fact_tokens = pred_seq[i, fact_start:fact_end]
+                        fact_str = self.decode(pred_fact_tokens)
+                        
+                        if '?' not in fact_str and 'PAD' not in fact_str and 'MASK' not in fact_str:
+                            # Validate factorization: should be "a*f1*f2" where f1*f2 = b
+                            try:
+                                parts = fact_str.split('*')
+                                if len(parts) == 3:
+                                    fact_a = int(parts[0])
+                                    fact_f1 = int(parts[1])
+                                    fact_f2 = int(parts[2])
+                                    
+                                    # Validate: fact_a should equal a, and fact_f1 * fact_f2 should equal b
+                                    if fact_a == a and fact_f1 * fact_f2 == b:
+                                        # Factorization is correct (could track accuracy here if needed)
+                                        pass
+                            except (ValueError, IndexError):
+                                pass  # Invalid factorization format
+                        
+                        # Compute carry sequence-level accuracy (all carry digits correct)
+                        if carry_matches == carry_trace_len:
+                            self.carry_sequence_correct += 1
+                    
+                    # Compute digit-level accuracy (for result digits only)
+                    expected_res_str = f"{expected_res:0{max_result_digits}d}"
+                    pred_res_str = result_str.rjust(max_result_digits, '0')[:max_result_digits]
+                    
+                    digit_matches = sum(1 for j in range(max_result_digits)
+                                      if j < len(expected_res_str) and j < len(pred_res_str)
+                                      and expected_res_str[j] == pred_res_str[j])
+                    self.digit_correct += digit_matches
+                    
+                    # Sequence-level accuracy (only result needs to be correct; carries are tracked separately)
+                    if pred_res == expected_res:
+                        self.sequence_correct += 1
+                
+                elif self.dataset_mode == "lilavati2_fact_only":
+                    # Lilavati2_fact_only: format is "XXX*YYY=PPPPPP <FACT> XXX*F1*F2" (factorization) or vanilla format (no FACT token)
+                    # Uses unified loss (same format as lilavati1_fact_only, but different loss computation)
+                    # Product is 2*digits after '='
+                    max_result_digits = 2 * self.digits
+                    result_start = eq_idx + 1
+                    result_end = result_start + max_result_digits
+                    
+                    pred_result_tokens = pred_seq[i, result_start:result_end]
+                    result_str = self.decode(pred_result_tokens)
+                    
+                    # Check for invalid tokens in result
+                    if '?' in result_str or 'PAD' in result_str or 'MASK' in result_str:
+                        continue
+                    
+                    # Find <FACT> token (from input, not predictions, as model may not predict it yet)
+                    # For examples without FACT token, treat like vanilla
+                    fact_idx = None
+                    for j in range(result_end, len(input_tokens)):
+                        if self.fact_token_id is not None and input_tokens[j] == self.fact_token_id:
+                            fact_idx = j
+                            break
+                    
+                    # Parse predicted result
+                    try:
+                        pred_res = int(result_str)
+                    except ValueError:
+                        continue
+                    
+                    # If FACT token exists, evaluate factorization predictions
+                    if fact_idx is not None:
+                        # Handle factorization: extract factorized expression
+                        # Factorized expression format: "XXX*F1*F2"
+                        fact_start = fact_idx + 1
+                        # Find where the factorized expression ends (look for end of sequence or next special token)
+                        fact_end = fact_start
+                        while fact_end < len(pred_seq[i]) and pred_seq[i, fact_end] not in [0, 1, 14, 15, 255]:  # Not PAD, MASK, CAR, FACT, IGNORE
+                            fact_end += 1
+                        
+                        pred_fact_tokens = pred_seq[i, fact_start:fact_end]
+                        fact_str = self.decode(pred_fact_tokens)
+                        
+                        if '?' not in fact_str and 'PAD' not in fact_str and 'MASK' not in fact_str:
+                            # Validate factorization: should be "a*f1*f2" where f1*f2 = b
+                            try:
+                                # Parse factorized expression
+                                parts = fact_str.split('*')
+                                if len(parts) == 3:
+                                    fact_a = int(parts[0])
+                                    fact_f1 = int(parts[1])
+                                    fact_f2 = int(parts[2])
+                                    
+                                    # Validate: fact_a should equal a, and fact_f1 * fact_f2 should equal b
+                                    if fact_a == a and fact_f1 * fact_f2 == b:
+                                        # Factorization is correct - could track this if needed
+                                        pass
+                            except (ValueError, IndexError):
+                                pass  # Invalid factorization format
+                    
+                    # Compute digit-level accuracy (for result digits only)
+                    expected_res_str = f"{expected_res:0{max_result_digits}d}"
+                    pred_res_str = result_str.rjust(max_result_digits, '0')[:max_result_digits]
+                    
+                    digit_matches = sum(1 for j in range(max_result_digits)
+                                      if j < len(expected_res_str) and j < len(pred_res_str)
+                                      and expected_res_str[j] == pred_res_str[j])
+                    self.digit_correct += digit_matches
+                    
+                    # Sequence-level accuracy (only result needs to be correct; factorization tracked separately if needed)
+                    if pred_res == expected_res:
+                        self.sequence_correct += 1
+                
             except Exception as e:
                 # Skip invalid examples
                 continue
@@ -268,7 +448,7 @@ class MultiplicationEvaluator:
     def result(self, save_path: Optional[str], rank: int, world_size: int, group=None):
         # Aggregate metrics
         if world_size > 1:
-            if self.dataset_mode == "lilavati1":
+            if self.dataset_mode in {"lilavati1", "lilavati1_fact_only", "lilavati2", "lilavati2_fact_only"}:
                 t = torch.tensor([self.total, self.digit_correct, self.sequence_correct, self.carry_correct, self.carry_total, self.carry_sequence_correct], device="cuda", dtype=torch.long)
             else:
                 t = torch.tensor([self.total, self.digit_correct, self.sequence_correct, 0, 0, 0], device="cuda", dtype=torch.long)
@@ -303,7 +483,7 @@ class MultiplicationEvaluator:
                 "val/sequence_accuracy": seq_acc,
             }
             
-            if self.dataset_mode == "lilavati1":
+            if self.dataset_mode in {"lilavati1", "lilavati2"}:
                 carry_digit_acc = carry_corr / carry_tot if carry_tot > 0 else 0.0
                 carry_seq_acc = carry_seq_corr / total if total > 0 else 0.0
                 metrics["val/carry_digit_accuracy"] = carry_digit_acc
@@ -311,6 +491,9 @@ class MultiplicationEvaluator:
                 # Keep backward compatibility
                 metrics["val/carry_accuracy"] = carry_digit_acc
                 print(f"Multiplication Eval ({self.dataset_mode}): digit_acc={digit_acc:.4f}, seq_acc={seq_acc:.4f}, carry_digit_acc={carry_digit_acc:.4f}, carry_seq_acc={carry_seq_acc:.4f} ({seq_corr}/{total})")
+            elif self.dataset_mode in {"lilavati1_fact_only", "lilavati2_fact_only"}:
+                # FACT-only mode: no carry metrics (only factorization)
+                print(f"Multiplication Eval ({self.dataset_mode}): digit_acc={digit_acc:.4f}, seq_acc={seq_acc:.4f} ({seq_corr}/{total})")
             else:
                 print(f"Multiplication Eval ({self.dataset_mode}): digit_acc={digit_acc:.4f}, seq_acc={seq_acc:.4f} ({seq_corr}/{total})")
             

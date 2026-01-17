@@ -1,0 +1,96 @@
+% =========================
+\section{Methodology}
+% =========================
+
+Our goal is to test whether explicitly supervising intermediate arithmetic structure---carry propagation and conditional factorization---can improve arithmetic faithfulness in Tiny Recursive Models (TRMs) without modifying the forward pass or inference-time behavior. We introduce two complementary supervision strategies that differ in how they treat intermediate structure: \textbf{Lil\={a}vati-2} for addition uses a unified loss that treats result and carry positions equally, while \textbf{Lil\={a}vati-1} for multiplication uses conditional probes that adapt supervision based on operand structure.
+
+\subsection{Task Formulation}
+We study fixed-length integer arithmetic of the form
+\[
+A + B = C \quad \text{(addition)} \qquad \text{and} \qquad A \times B = C \quad \text{(multiplication)}
+\]
+where both operands contain exactly $d$ digits. Training is performed on problems with $d \leq 4$, while evaluation includes both in-distribution (3--4 digit) and out-of-distribution (5--6 digit) cases.
+
+\subsection{Baseline: Tiny Recursive Model}
+We use a standard Tiny Recursive Model (TRM)~\cite{trm2024}. The model maintains an embedded input $x$, a latent state $z$, and a current answer representation $y$. A single small neural network is applied recursively to update $(z,y)$ over multiple reasoning steps. The model uses a hidden state size of 512 and performs hierarchical reasoning with two high-level cycles, each containing four low-level cycles. A learned halting mechanism allows early termination, with a maximum of eight reasoning steps. The decoding head predicts only the result digits.
+
+\subsection{Lil\={a}vati-2: Unified Carry Supervision for Addition}
+Lil\={a}vati-2 implements a \textbf{unified carry supervision} strategy that treats carry propagation as an integral part of the output sequence, rather than an auxiliary signal. The approach is minimal: carry information is embedded in the training sequence alongside result digits, and both are supervised using a single unified cross-entropy loss computed over the entire sequence.
+
+\subsubsection{Sequence Format}
+Training sequences are augmented with a special delimiter token $\langle \text{CAR} \rangle$ that separates result digits from carry digits:
+\[
+\text{Input: } A + B = \langle \text{MASK} \rangle^d \langle \text{CAR} \rangle \langle \text{MASK} \rangle^{d+1}
+\]
+\[
+\text{Label: } A + B = C_0 C_1 \ldots C_{d-1} \langle \text{CAR} \rangle c_0 c_1 \ldots c_d
+\]
+where $C_i$ are result digits and $c_j$ are carry values (binary: 0 or 1) propagated from each column. The carry sequence has length $d+1$ to include the final carry-out position.
+
+\subsubsection{Unified Loss Computation}
+Unlike approaches that weight result and carry losses separately, Lil\={a}vati-2 computes a single cross-entropy loss over all positions in the sequence:
+\[
+\mathcal{L} = \text{CrossEntropy}(\text{logits}, \text{labels}, \text{mask}),
+\]
+where the mask includes both result positions (before $\langle \text{CAR} \rangle$) and carry positions (after $\langle \text{CAR} \rangle$). This unified loss treats result and carry predictions symmetrically: both are outputs of the same underlying place-value computation, and both contribute equally to the optimization signal. The model uses a single language modeling head to produce logits for all positions, reflecting the view that carry and result digits differ only in their semantic role, not in their representational requirements.
+
+\subsubsection{Auxiliary Supervision Principle}
+The key design principle is that carry supervision is \emph{auxiliary}: it guides internal representations during training but does not alter inference-time behavior. Specifically:
+\begin{itemize}
+\item The forward computation through the recursive reasoning loop is unchanged.
+\item The same decoding head produces logits for both result and carry positions.
+\item Carry predictions are never fed back into the model or used for decoding.
+\item At inference, the model predicts only result digits, exactly as in vanilla TRM training.
+\end{itemize}
+
+This ensures that any improvements stem from better internal representations rather than architectural modifications.
+
+\subsection{Lil\={a}vati-1: Conditional Factorization Probes for Multiplication}
+Lil\={a}vati-1 implements a \textbf{conditional factorization probe} strategy that adapts intermediate supervision based on operand structure. When operands admit factorization, the model is supervised on the reduced computation path; otherwise, it is supervised on explicit carry propagation from columnar multiplication. This conditional approach reflects the classical Indian arithmetic principle that different operand structures warrant different computational procedures.
+
+\subsubsection{Conditional Sequence Format}
+Training sequences are conditionally augmented based on operand structure. For each multiplication instance $A \times B = C$:
+
+\textbf{If factorization exists}: When $B$ can be decomposed as $B = f_1 \times f_2$ for non-trivial factors $f_1, f_2$, the sequence uses factorization supervision:
+\[
+\text{Input: } A \times B = \langle \text{MASK} \rangle^{2d} \langle \text{FACT} \rangle \langle \text{MASK} \rangle^m
+\]
+\[
+\text{Label: } A \times B = C_0 C_1 \ldots C_{2d-1} \langle \text{FACT} \rangle A \times f_1 \times f_2
+\]
+where $m$ is the length of the factorized expression $A \times f_1 \times f_2$.
+
+\textbf{Otherwise}: When no factorization is available, the sequence uses carry trace supervision:
+\[
+\text{Input: } A \times B = \langle \text{MASK} \rangle^{2d} \langle \text{CAR} \rangle \langle \text{MASK} \rangle^{d^2}
+\]
+\[
+\text{Label: } A \times B = C_0 C_1 \ldots C_{2d-1} \langle \text{CAR} \rangle c_0 c_1 \ldots c_{d^2-1}
+\]
+where $c_j$ are carry values from the columnar multiplication procedure (one carry per digit pair in the partial product computation).
+
+\subsubsection{Probe-Based Supervision}
+The term ``probe'' here refers to the conditional nature of the supervision signal: the model is probed on different intermediate structures depending on operand properties, but both probes use the same language modeling head. Factorization supervision encourages the model to recognize and exploit structural decompositions when available, while carry supervision stabilizes the default columnar procedure. The conditional selection ensures that each training example receives the most informative intermediate signal for its specific operand structure.
+
+\subsubsection{Weighted Loss Computation}
+Training minimizes a combined loss that weights result and intermediate supervision:
+\[
+\mathcal{L} = \mathcal{L}_{\text{result}} + \lambda \mathcal{L}_{\text{intermediate}},
+\]
+where $\mathcal{L}_{\text{result}}$ is cross-entropy loss on result digit positions (before the special token), $\mathcal{L}_{\text{intermediate}}$ is cross-entropy loss on either factorization or carry positions (after the special token), and $\lambda$ is a hyperparameter controlling the relative weight of intermediate supervision. We set $\lambda = 0.5$ to ensure that intermediate supervision provides meaningful guidance without dominating optimization.
+
+Both losses are computed using the same logits from the language modeling head, with positional masks selecting the relevant positions. This unified computation reflects the view that factorization and carry traces are both valid intermediate representations of the same underlying computation, differing only in when they are applicable.
+
+\subsubsection{Auxiliary Supervision Principle}
+As with Lil\={a}vati-2, the key design principle is that intermediate supervision is \emph{auxiliary}: it guides internal representations during training but does not alter inference-time behavior. Specifically:
+\begin{itemize}
+\item The forward computation through the recursive reasoning loop is unchanged.
+\item The same decoding head produces logits for both result and intermediate positions.
+\item Factorization and carry predictions are never fed back into the model or used for decoding.
+\item At inference, the model predicts only result digits, exactly as in vanilla TRM training.
+\end{itemize}
+
+The conditional nature of the probes ensures that the model learns to recognize structural opportunities (factorization) when they exist, while maintaining robust columnar computation (carry propagation) as the default procedure.
+
+\subsection{Comparison of Approaches}
+Lil\={a}vati-2 and Lil\={a}vati-1 represent complementary strategies for intermediate supervision. Lil\={a}vati-2 treats carry as a first-class output that receives equal weight with result digits in a unified loss, emphasizing the symmetry between result and carry in place-value arithmetic. Lil\={a}vati-1 uses conditional probes that adapt supervision to operand structure, reflecting the classical principle that different computational paths are valid and should be recognized when applicable. Both approaches preserve the simplicity of the TRM architecture while providing targeted guidance for intermediate structure, enabling the model to learn more faithful arithmetic procedures without architectural modification.

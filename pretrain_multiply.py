@@ -755,13 +755,15 @@ def launch(hydra_config: DictConfig):
         # Set W&B project name based on dataset_mode
         project_name = config.project_name if config.project_name is not None else "trm-lilavati-multiply"
         
-        # Ensure run_name follows convention: vanilla_trm_d3 or lilavati1_trm_d3
+        # Ensure run_name follows convention: vanilla_trm_d3 or lilavati1_trm_d3 or lilavati1_fact_only_trm_d3
         run_name = config.run_name
         if run_name is None:
             if config.dataset_mode == "vanilla":
                 run_name = f"vanilla_trm_d{config.digits}"
             elif config.dataset_mode == "lilavati1":
                 run_name = f"lilavati1_trm_d{config.digits}"
+            elif config.dataset_mode == "lilavati1_fact_only":
+                run_name = f"lilavati1_fact_only_trm_d{config.digits}"
             else:
                 run_name = f"{config.dataset_mode}_trm_d{config.digits}"
         

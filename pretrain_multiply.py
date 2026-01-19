@@ -753,19 +753,17 @@ def launch(hydra_config: DictConfig):
         wandb_config = config.model_dump()
         
         # Set W&B project name based on dataset_mode
-        project_name = config.project_name if config.project_name is not None else "trm-lilavati"
+        project_name = config.project_name if config.project_name is not None else "trm-lilavati-multiply"
         
-        # Ensure run_name follows convention: vanilla_trm_d3 or lilavati1_trm_d3 or lilavati2_trm_d3
+        # Ensure run_name follows convention: vanilla_trm_d3 or lilavati1_trm_d3 or lilavati1_fact_only_trm_d3
         run_name = config.run_name
         if run_name is None:
             if config.dataset_mode == "vanilla":
                 run_name = f"vanilla_trm_d{config.digits}"
             elif config.dataset_mode == "lilavati1":
                 run_name = f"lilavati1_trm_d{config.digits}"
-            elif config.dataset_mode == "lilavati2":
-                run_name = f"lilavati2_trm_d{config.digits}"
-            elif config.dataset_mode == "lilavati3":
-                run_name = f"lilavati3_trm_d{config.digits}"
+            elif config.dataset_mode == "lilavati1_fact_only":
+                run_name = f"lilavati1_fact_only_trm_d{config.digits}"
             else:
                 run_name = f"{config.dataset_mode}_trm_d{config.digits}"
         
@@ -774,15 +772,8 @@ def launch(hydra_config: DictConfig):
             "model": "TRM",
             "variant": config.dataset_mode,
             "digits": config.digits,
-            "include_carry": config.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"},
+            "task": "multiplication",
         })
-        if config.dataset_mode in {"lilavati1", "lilavati2", "lilavati3"}:
-            wandb_config["carry_token"] = "<CAR>"
-        if config.dataset_mode == "lilavati2":
-            wandb_config["separate_carry_head"] = True
-        if config.dataset_mode == "lilavati3":
-            wandb_config["separate_carry_head"] = True
-            wandb_config["separate_carry_latent"] = True
         
         wandb.init(project=project_name, name=run_name, config=wandb_config, settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)

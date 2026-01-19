@@ -65,6 +65,7 @@ class ACTLossHead(nn.Module):
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
         labels_carry = new_carry.current_data.get("labels_carry", None)  # From lilavati dataset
+        labels_aux = new_carry.current_data.get("labels_aux", None)      # From dual_head dataset
 
         # For lilavati1/lilavati2/lilavati3/lilavati1_fact_only/lilavati2_fact_only: need to compute masks before predictions
         # lilavati1 now uses same format as lilavati3 (single sequence with CAR/AVY/FACT token)
@@ -340,6 +341,23 @@ class ACTLossHead(nn.Module):
             
             # Total loss: L_y + λ * L_carry
             total_lm_loss = lm_loss + self.carry_loss_weight * carry_loss
+        
+        elif self.dataset_mode == "dual_head" and labels_aux is not None:
+             # Basic LM Loss (labels already masked for Prompt)
+             lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+             
+             # Aux Head Loss (labels_aux already masked for Prompt)
+             aux_mask = (labels_aux != IGNORE_LABEL_ID)
+             aux_divisor = aux_mask.sum(-1).clamp_min(1).unsqueeze(-1)
+             
+             aux_loss = (self.loss_fn(outputs["carry_logits"], labels_aux, ignore_index=IGNORE_LABEL_ID, valid_mask=aux_mask) / aux_divisor).sum()
+             
+             total_lm_loss = lm_loss + self.carry_loss_weight * aux_loss
+             
+             with torch.no_grad():
+                 metrics["aux_loss"] = aux_loss.detach()
+                 aux_correct = aux_mask & (torch.argmax(outputs["carry_logits"], dim=-1) == labels_aux)
+                 metrics["aux_accuracy"] = torch.where(valid_metrics, (aux_correct.to(torch.float32) / aux_divisor).sum(-1), 0).sum()
         
         else:
             # Vanilla / lilavati1 without labels_carry (evaluation): original behavior

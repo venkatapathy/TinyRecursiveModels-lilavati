@@ -13,14 +13,14 @@ from dataset.common import PuzzleDatasetMetadata
 class BasicFourEvaluator:
     required_outputs = {"inputs", "preds"}
 
-    def __init__(self, data_path: str, eval_metadata: PuzzleDatasetMetadata):
+    def __init__(self, data_path: str, eval_metadata: PuzzleDatasetMetadata, **kwargs):
         # Vocabulary mapping (must match build_basicfour_dataset.py)
         self.vocab_map_inv = {i + 2: str(i) for i in range(10)}
         self.vocab_map_inv[12] = '+'
-        self.vocab_map_inv[13] = '='
-        self.vocab_map_inv[14] = '-'
-        self.vocab_map_inv[15] = '*'
-        self.vocab_map_inv[16] = '/'
+        self.vocab_map_inv[13] = '-'
+        self.vocab_map_inv[14] = '*'
+        self.vocab_map_inv[15] = '/'
+        self.vocab_map_inv[16] = '='
         self.vocab_map_inv[17] = 'R'
         self.vocab_map_inv[0] = 'PAD'
         self.vocab_map_inv[1] = 'MASK'
@@ -135,7 +135,9 @@ class BasicFourEvaluator:
                 continue
             
             # Get predicted result (tokens after '=')
-            pred_tokens = pred_seqs[i, eq_pos + 1:]
+            # preds are next-token predictions (aligned with input positions).
+            # The prediction made AT the position of `=` (eq_pos) is the first token of the result.
+            pred_tokens = pred_seqs[i, eq_pos:]
             pred_str = self.decode(pred_tokens)
             
             # Compute expected result
@@ -147,6 +149,9 @@ class BasicFourEvaluator:
             if pred_str == expected:
                 self.correct += 1
                 self.op_correct[op] += 1
+                
+            if self.total <= 5:
+                 print(f"DEBUG: Input='{input_str}' Op='{op}' A={a} B={b} Expected='{expected}' PredTokens={pred_tokens} PredStr='{pred_str}' Correct={pred_str == expected}")
 
     def result(self, save_path: Optional[str], rank: int, world_size: int, group=None) -> Optional[Dict[str, float]]:
         """Aggregate and return metrics."""

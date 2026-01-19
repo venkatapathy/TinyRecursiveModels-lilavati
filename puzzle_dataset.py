@@ -161,6 +161,7 @@ class PuzzleDataset(IterableDataset):
         self._data = {}
         inputs_carry_data = {}  # Store inputs_carry separately (for lilavati1)
         labels_carry_data = {}  # Store labels_carry separately
+        labels_aux_data = {}    # Store labels_aux separately (for dual_head)
         
         # Check if any dataset has labels_carry (lilavati datasets)
         has_any_lilavati = False
@@ -198,8 +199,20 @@ class PuzzleDataset(IterableDataset):
                     # Load inputs_carry if available (for lilavati1)
                     if has_inputs_carry:
                         inputs_carry_data[set_name_] = np.load(inputs_carry_path, mmap_mode="r")
-                else:
-                    # Vanilla dataset
+                
+                # Check for labels_aux (dual_head)
+                labels_aux_path = os.path.join(dataset_path, self.split, f"{set_name}__labels_aux.npy")
+                if os.path.exists(labels_aux_path):
+                     # Ensure main data is initialized if not already (e.g. vanilla base)
+                     if set_name_ not in self._data:
+                        self._data[set_name_] = {
+                            field_name: np.load(os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
+                            for field_name, mmap_mode in field_mmap_modes.items()
+                        }
+                     labels_aux_data[set_name_] = np.load(labels_aux_path, mmap_mode="r")
+                
+                if not has_labels_carry and set_name_ not in self._data:
+                    # Vanilla dataset logic (only if not loaded by labels_aux block above)
                     if has_any_lilavati:
                         # When mixing with lilavati: only load labels (inputs will come from lilavati dataset)
                         # Store labels separately with a special key
@@ -225,6 +238,11 @@ class PuzzleDataset(IterableDataset):
             self._inputs_carry_data = inputs_carry_data
         else:
             self._inputs_carry_data = None
+            
+        if labels_aux_data:
+            self._labels_aux_data = labels_aux_data
+        else:
+            self._labels_aux_data = None
 
 
     def _collate_batch(self, batch):
@@ -237,6 +255,8 @@ class PuzzleDataset(IterableDataset):
             # Also convert labels_carry if present
             if "labels_carry" in batch:
                 batch["labels_carry"][batch["labels_carry"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
+            if "labels_aux" in batch:
+                batch["labels_aux"][batch["labels_aux"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
 
         # Pad
         if batch["puzzle_identifiers"].size < self.local_batch_size:
@@ -246,6 +266,7 @@ class PuzzleDataset(IterableDataset):
                 "labels": IGNORE_LABEL_ID,
                 "inputs_carry": self.metadata.pad_id,  # For inputs_carry padding
                 "labels_carry": IGNORE_LABEL_ID,  # For labels_carry padding
+                "labels_aux": IGNORE_LABEL_ID,    # For labels_aux padding
                 "puzzle_identifiers": self.metadata.blank_identifier_id
             }
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values.get(k, 0)) for k, v in batch.items()}
@@ -285,6 +306,8 @@ class PuzzleDataset(IterableDataset):
                     batch_dict["inputs_carry"] = self._inputs_carry_data[set_name][local_start: local_end]
                 if hasattr(self, '_labels_carry_data') and self._labels_carry_data is not None and set_name in self._labels_carry_data:
                     batch_dict["labels_carry"] = self._labels_carry_data[set_name][local_start: local_end]
+                if hasattr(self, '_labels_aux_data') and self._labels_aux_data is not None and set_name in self._labels_aux_data:
+                    batch_dict["labels_aux"] = self._labels_aux_data[set_name][local_start: local_end]
                 
                 batch = self._collate_batch(batch_dict)
 
@@ -333,6 +356,8 @@ class PuzzleDataset(IterableDataset):
                     batch_dict["inputs_carry"] = self._inputs_carry_data[set_name][batch_indices]
                 if hasattr(self, '_labels_carry_data') and self._labels_carry_data is not None and set_name in self._labels_carry_data:
                     batch_dict["labels_carry"] = self._labels_carry_data[set_name][batch_indices]
+                if hasattr(self, '_labels_aux_data') and self._labels_aux_data is not None and set_name in self._labels_aux_data:
+                    batch_dict["labels_aux"] = self._labels_aux_data[set_name][batch_indices]
                 
                 batch = self._collate_batch(batch_dict)
 

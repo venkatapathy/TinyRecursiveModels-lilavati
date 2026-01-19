@@ -1,0 +1,50 @@
+defaults:
+  - arch: trm
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Data path (Dual Head dataset)
+data_paths: ['data/arithmetic_dual']
+data_paths_test: ['data/arithmetic_dual']
+
+# We disable specific evaluators for now as they might expect specific metadata
+evaluators:
+  - name: basicfour@BasicFourEvaluator
+
+# Dataset mode
+dataset_mode: "dual_head"
+digits: 32 # Upper bound for safety
+
+# Hyperparams - Training
+global_batch_size: 256
+
+epochs: 100
+eval_interval: 1
+checkpoint_every_eval: False
+
+lr: 1e-4
+lr_min_ratio: 0.01
+lr_warmup_steps: 100
+grad_clip: 1.0
+
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.0
+
+# Hyperparams - Puzzle embeddings training
+puzzle_emb_lr: 0.0
+
+seed: 42
+min_eval_interval: 0
+
+project_name: "trm-dual"
+run_name: "basic_four_dual_head"
+
+# Dual Head specific: Aux loss weight (lambda)
+arch:
+  carry_loss_weight: 1.0
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0

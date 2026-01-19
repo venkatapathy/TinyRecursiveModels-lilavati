@@ -136,8 +136,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
         
         # Lilavati3: separate carry head (lilavati1 and lilavati2 use only lm_head)
+        # Lilavati3: separate carry head (lilavati1 and lilavati2 use only lm_head)
         if self.config.dataset_mode == "lilavati3":
             self.carry_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        elif self.config.dataset_mode == "dual_head":
+            self.aux_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -235,7 +238,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # For lilavati3: both heads needed for same input (result and carry positions in same sequence)
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         carry_logits = None
-        if self.config.dataset_mode == "lilavati3":
+        if self.config.dataset_mode == "dual_head":
+            carry_logits = self.aux_head(z_H)[:, self.puzzle_emb_len:]
+        elif self.config.dataset_mode == "lilavati3":
             carry_logits = self.carry_head(z_H)[:, self.puzzle_emb_len:]
         
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position

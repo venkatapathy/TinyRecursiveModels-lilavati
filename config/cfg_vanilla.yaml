@@ -1,0 +1,48 @@
+# Config for Vanilla Basic Four Training
+defaults:
+  - arch: trm
+  - _self_
+
+# Hydra setup
+hydra:
+  output_subdir: null
+
+# Project info
+project_name: trm-dual
+run_name: basic_four_vanilla
+
+# Data Path (Using the same dual_head dataset which is compatible)
+data_paths: ['data/arithmetic_dual']
+data_paths_test: ['data/arithmetic_dual']
+
+# Evaluators
+evaluators:
+  - name: basicfour@BasicFourEvaluator
+
+# Dataset mode
+dataset_mode: "vanilla"
+digits: 32 # Maximum digits (global setting)
+
+# Hyperparams - Training
+global_batch_size: 256
+
+epochs: 100
+eval_interval: 1
+checkpoint_every_eval: False
+
+# Optimizer
+lr: 1e-4
+lr_min_ratio: 0.1
+lr_warmup_steps: 1000
+weight_decay: 0.05
+beta1: 0.9
+beta2: 0.95
+
+# Puzzle Embedding (Disabled for arithmetic)
+puzzle_emb_lr: 0.0
+puzzle_emb_weight_decay: 0.0
+
+# Arch Override: Disable Puzzle Embeddings specific to this dataset
+arch:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0

@@ -45,6 +45,6 @@ run_name: "basic_four_dual_head"
 
 # Dual Head specific: Aux loss weight (lambda)
 arch:
-  carry_loss_weight: 1.0
+  carry_loss_weight: 0.1
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0

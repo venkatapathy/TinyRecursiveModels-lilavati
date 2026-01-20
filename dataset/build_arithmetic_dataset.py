@@ -32,12 +32,30 @@ import os
 import random
 import sys
 from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
 
 # -----------------------------------------------------------------------------
 # Configuration & Constants
 # -----------------------------------------------------------------------------
 
 OPS = ["+", "-", "*", "/"]
+
+# -----------------------------------------------------------------------------
+# Vocabulary & Constants (Aligned with Causal LM)
+# -----------------------------------------------------------------------------
+
+VOCAB_MAP = {
+    '0': 2, '1': 3, '2': 4, '3': 5, '4': 6,
+    '5': 7, '6': 8, '7': 9, '8': 10, '9': 11,
+    '+': 12, '-': 13, '*': 14, '/': 15, '=': 16,
+    'R': 17
+}
+PAD_ID = 0
+IGNORE_LABEL_ID = -100
+
+def encode_str(s: str) -> List[int]:
+    return [VOCAB_MAP[c] for c in s]
+
 
 # -----------------------------------------------------------------------------
 # Arithmetic Logic with Intermediate Labels
@@ -454,6 +472,149 @@ class Sampler:
         return self.rng.randint(min_v, max_v)
 
 # -----------------------------------------------------------------------------
+# Conversion & Saving Logic
+# -----------------------------------------------------------------------------
+
+def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: str, max_len: int):
+    """
+    Converts structured data items to padded numpy arrays and saves them.
+    """
+    print(f"Processing {split_name} ({len(data_items)} examples)...")
+    
+    inputs_list = []
+    labels_lm_list = []
+    labels_aux_list = []
+
+    for item in data_items:
+        # data_items contains the "structured_obj" dicts
+        
+        A = item["A"]
+        B = item["B"]
+        op = item["op"]
+        Y = item["Y"]
+        
+        # Input Prompt: "A op B ="
+        prompt_str = f"{A}{op}{B}="
+        prompt_ids = encode_str(prompt_str)
+        
+        # Result: "Y"
+        result_ids = encode_str(Y)
+        
+        # Full Input: Prompt + Result
+        input_ids = prompt_ids + result_ids
+        
+        # Aux Labels: IGNORE on Prompt, Carry ids on Result
+        inter_list = []
+        if op == '+':
+            inter_list = item["labels"].get("add_carry", [])
+        elif op == '-':
+            inter_list = item["labels"].get("sub_borrow", [])
+        elif op == '*':
+            inter_list = item["labels"].get("mul_carry_cols", [])
+        elif op == '/':
+            inter_list = [] # No aux training for div yet
+            
+        if len(inter_list) > 0:
+            safe_list = []
+            for x in inter_list:
+                if x >= 20: 
+                    safe_list.append(IGNORE_LABEL_ID)
+                else:
+                    safe_list.append(x)
+            inter_list = safe_list
+            
+        if len(inter_list) == 0:
+             aux_labels = [IGNORE_LABEL_ID] * len(input_ids)
+        else:
+             target_len = len(result_ids)
+             if len(inter_list) >= target_len:
+                 aligned_inter = inter_list[-target_len:]
+             else:
+                 diff = target_len - len(inter_list)
+                 aligned_inter = [0]*diff + inter_list
+            
+             aux_labels = [IGNORE_LABEL_ID] * len(prompt_ids) + aligned_inter
+        
+        # CAUSAL LM SHIFTING
+        full_ids = prompt_ids + result_ids
+        shifted_lm_labels = full_ids[1:] + [PAD_ID]
+        
+        # Masking Prompt (Keep only the '=' prediction which is Result[0])
+        # Indices 0 to len(prompt_ids)-2 should be IGNORED.
+        # index len(prompt_ids)-1 is '=', predicting Result[0].
+        for i in range(len(prompt_ids) - 1):
+            shifted_lm_labels[i] = IGNORE_LABEL_ID
+            
+        lm_labels = shifted_lm_labels
+        
+        # Shift Aux Labels
+        shifted_aux_labels = aux_labels[1:] + [PAD_ID]
+        aux_labels = shifted_aux_labels
+        
+        assert len(input_ids) == len(lm_labels) == len(aux_labels)
+        
+        inputs_list.append(input_ids)
+        labels_lm_list.append(lm_labels)
+        labels_aux_list.append(aux_labels)
+
+    # Padding
+    padded_inputs = []
+    padded_lm = []
+    padded_aux = []
+    
+    puzzle_indices = [0]
+    group_indices = [0]
+    puzzle_identifiers = []
+
+    for idx, (inp, lm, aux) in enumerate(zip(inputs_list, labels_lm_list, labels_aux_list)):
+        pad_len = max_len - len(inp)
+        if pad_len < 0:
+             # Truncate if too long (should not happen if args correct, but safety)
+             # print(f"Warning: Example {idx} exceeds max_len {max_len} (len={len(inp)}). Truncating.")
+             inp = inp[:max_len]
+             lm = lm[:max_len]
+             aux = aux[:max_len]
+             pad_len = 0
+        
+        padded_inputs.append(inp + [PAD_ID] * pad_len)
+        padded_lm.append(lm + [IGNORE_LABEL_ID] * pad_len)
+        padded_aux.append(aux + [IGNORE_LABEL_ID] * pad_len)
+        
+        puzzle_indices.append(idx + 1)
+        group_indices.append(idx + 1)
+        puzzle_identifiers.append(0)
+
+    # Save
+    save_dir = os.path.join(output_dir, split_name)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    np.save(os.path.join(save_dir, "all__inputs.npy"), np.array(padded_inputs, dtype=np.uint8))
+    np.save(os.path.join(save_dir, "all__labels.npy"), np.array(padded_lm, dtype=np.int64))
+    np.save(os.path.join(save_dir, "all__labels_aux.npy"), np.array(padded_aux, dtype=np.int64))
+    
+    np.save(os.path.join(save_dir, "all__puzzle_indices.npy"), np.array(puzzle_indices, dtype=np.int32))
+    np.save(os.path.join(save_dir, "all__group_indices.npy"), np.array(group_indices, dtype=np.int32))
+    np.save(os.path.join(save_dir, "all__puzzle_identifiers.npy"), np.array(puzzle_identifiers, dtype=np.int32))
+    
+    metadata = {
+        "seq_len": max_len,
+        "vocab_size": 20,
+        "pad_id": PAD_ID,
+        "ignore_label_id": IGNORE_LABEL_ID,
+        "blank_identifier_id": 0,
+        "num_puzzle_identifiers": 1,
+        "total_groups": len(inputs_list),
+        "mean_puzzle_examples": 1.0,
+        "total_puzzles": len(inputs_list),
+        "sets": ["all"],
+        "total_examples": len(inputs_list)
+    }
+    with open(os.path.join(save_dir, "dataset.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+        
+    print(f"  Saved numpy arrays to {save_dir}")
+
+# -----------------------------------------------------------------------------
 # Main Application
 # -----------------------------------------------------------------------------
 
@@ -467,6 +628,7 @@ def main():
     parser.add_argument("--train_max_result_digits", type=int, default=8)
     parser.add_argument("--test_max_result_digits", type=int, default=12)
     parser.add_argument("--allow_zero", action="store_true", help="Allow 0 operands")
+    parser.add_argument("--max_len", type=int, default=64, help="Padded sequence length")
     
     args = parser.parse_args()
     
@@ -484,6 +646,8 @@ def main():
     
     # Files
     files = {}
+    data_buffer = {"train": [], "val": [], "test": []}
+    
     for split in ["train", "val", "test"]:
         files[f"vanilla_{split}"] = open(os.path.join(args.output_dir, f"vanilla_{split}.jsonl"), "w")
         files[f"structured_{split}"] = open(os.path.join(args.output_dir, f"structured_{split}.jsonl"), "w")
@@ -582,6 +746,9 @@ def main():
                 json.dump(structured_obj, files[f"structured_{split}"])
                 files[f"structured_{split}"].write("\n")
                 
+                # Buffer for numpy conversion
+                data_buffer[split].append(structured_obj)
+                
                 # Stats
                 stats["counts"][f"{split}_{op}"] += 1
                 res_len = len(data["Y"])
@@ -607,6 +774,15 @@ def main():
     # Summary
     print("\nGeneration Complete.")
     print(f"Stats saved to {stats_path}")
+    
+    # Run conversion
+    print("\nStarting Numpy Conversion...")
+    for split in ["train", "val", "test"]:
+        if len(data_buffer[split]) > 0:
+            process_and_save_split(data_buffer[split], args.output_dir, split, args.max_len)
+        else:
+            print(f"Skipping {split}, no data.")
+
     print("Example Structured Outputs:")
     for ex in example_buffer:
         print(json.dumps(ex, indent=2))

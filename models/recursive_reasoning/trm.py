@@ -132,7 +132,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         embed_init_std = 1.0 / self.embed_scale
 
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.lm_head      = CastedLinear(self.config.hidden_size * 2, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
         
         # Lilavati3: separate carry head (lilavati1 and lilavati2 use only lm_head)
@@ -236,7 +236,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Compute heads based on dataset mode
         # For lilavati1/lilavati2: only lm_head for both result and carry (same as vanilla but with CAR token)
         # For lilavati3: both heads needed for same input (result and carry positions in same sequence)
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        output = self.lm_head(torch.cat([z_H, z_L], dim=-1))[:, self.puzzle_emb_len:]
         carry_logits = None
         if self.config.dataset_mode == "dual_head":
             carry_logits = self.aux_head(z_H)[:, self.puzzle_emb_len:]

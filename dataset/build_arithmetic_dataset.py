@@ -475,7 +475,7 @@ class Sampler:
 # Conversion & Saving Logic
 # -----------------------------------------------------------------------------
 
-def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: str, max_len: int):
+def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: str, max_len: int, dataset_mode: str = "vanilla", vocab_map: Dict = None):
     """
     Converts structured data items to padded numpy arrays and saves them.
     """
@@ -503,16 +503,81 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
         # Full Input: Prompt + Result
         input_ids = prompt_ids + result_ids
         
+        # BASICFOUR CONCAT LOGIC
+        concat_suffix_ids = []
+        if dataset_mode == "basicfour_concat":
+            # 1. Determine CAR token
+            car_token_id = vocab_map.get(f"<CAR_{op}>")
+            if car_token_id is None:
+                 # Fallback or error?
+                 # Should fail if map is correct.
+                 raise ValueError(f"Missing CAR token for op {op}")
+            
+            # 2. Get Intermediate Data
+            # Note: We need digits as strings/ids, not raw ints 0-9 usually? 
+            # Current `inter_list` logic below gets ints. The model needs vocab IDs.
+            # Digits 0-9 map to vocab IDs 2-11.
+            # We should reuse the logic or convert.
+            
+            inter_val_list = []
+            if op == '+': inter_val_list = item["labels"].get("add_carry", [])
+            elif op == '-': inter_val_list = item["labels"].get("sub_borrow", [])
+            elif op == '*': inter_val_list = item["labels"].get("mul_carry_cols", [])
+            elif op == '/': 
+                # Division: "div_q_digits", "div_remainders"
+                # For now let's just dump remainders? Or both?
+                # User prompted "concatinated prediction".
+                # Standard Lilavati usually just does carries. 
+                # Let's concatenate remainders for division as they are the "state".
+                inter_val_list = item["labels"].get("div_remainders", [])
+            
+            # Map integers to vocab IDs
+            # Simple digits 0-9 -> VOCAB_MAP[str(d)]
+            # If value > 9 (like carry 12), we treat it as multi-digit? 
+            # Or is carry always single digit? 
+            # Addition carry <= 1. Sub borrow <= 1. 
+            # Mul carry cols can be large! e.g. 9*9 + 8 = 89 -> carry 8.
+            # Sum of products can be larger. 
+            # If carry > 9, we need multi-token representation or special tokens.
+            # For now, let's assume we output digits of the carry value if > 9.
+            # But "Lilavati" usually assumes single digit? 
+            # Wait, `trm.py` usually predicts a single token. 
+            # If carry > 9 (possible in Mul), we might need to separate it. 
+            # Let's stringify each value and encode.
+            
+            suffix_str_parts = []
+            for val in inter_val_list:
+                suffix_str_parts.append(str(val)) # e.g. "1", "0", "12"
+            
+            # Join with what? Just sequence? 
+            # Usually: <CAR> c1 c2 c3 ...
+            # If c_i is "12", it becomes "1" "2". 
+            # BUT we lose boundary. 
+            # Ideally Mul carries are single "values" but if they exceed 9, we need boundaries or multi-token.
+            # Let's treat them as sequence of digits.
+            
+            suffix_seq_ids = [car_token_id]
+            for val in inter_val_list:
+                s_val = str(val)
+                for char in s_val:
+                    suffix_seq_ids.append(VOCAB_MAP[char])
+            
+            concat_suffix_ids = suffix_seq_ids
+            
+            # Append to inputs
+            input_ids = input_ids + concat_suffix_ids
+        
         # Aux Labels: IGNORE on Prompt, Carry ids on Result
         inter_list = []
-        if op == '+':
-            inter_list = item["labels"].get("add_carry", [])
-        elif op == '-':
-            inter_list = item["labels"].get("sub_borrow", [])
-        elif op == '*':
-            inter_list = item["labels"].get("mul_carry_cols", [])
-        elif op == '/':
-            inter_list = [] # No aux training for div yet
+        if dataset_mode != "basicfour_concat":
+            if op == '+':
+                inter_list = item["labels"].get("add_carry", [])
+            elif op == '-':
+                inter_list = item["labels"].get("sub_borrow", [])
+            elif op == '*':
+                inter_list = item["labels"].get("mul_carry_cols", [])
+            elif op == '/':
+                inter_list = [] # No aux training for div yet
             
         if len(inter_list) > 0:
             safe_list = []
@@ -536,7 +601,7 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
              aux_labels = [IGNORE_LABEL_ID] * len(prompt_ids) + aligned_inter
         
         # CAUSAL LM SHIFTING
-        full_ids = prompt_ids + result_ids
+        full_ids = prompt_ids + result_ids + concat_suffix_ids
         shifted_lm_labels = full_ids[1:] + [PAD_ID]
         
         # Masking Prompt (Keep only the '=' prediction which is Result[0])
@@ -598,7 +663,9 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
     
     metadata = {
         "seq_len": max_len,
-        "vocab_size": 20,
+        "seq_len": max_len,
+        "vocab_size": 22,
+        "pad_id": PAD_ID,
         "pad_id": PAD_ID,
         "ignore_label_id": IGNORE_LABEL_ID,
         "blank_identifier_id": 0,
@@ -629,6 +696,7 @@ def main():
     parser.add_argument("--test_max_result_digits", type=int, default=12)
     parser.add_argument("--allow_zero", action="store_true", help="Allow 0 operands")
     parser.add_argument("--max_len", type=int, default=64, help="Padded sequence length")
+    parser.add_argument("--dataset_mode", type=str, default="basicfour_concat", choices=["vanilla", "lilavati1", "lilavati2", "lilavati3", "basicfour_concat"], help="Dataset mode")
     
     args = parser.parse_args()
     
@@ -647,7 +715,7 @@ def main():
     # Files
     files = {}
     data_buffer = {"train": [], "val": [], "test": []}
-    
+    dataset_mode = args.dataset_mode
     for split in ["train", "val", "test"]:
         files[f"vanilla_{split}"] = open(os.path.join(args.output_dir, f"vanilla_{split}.jsonl"), "w")
         files[f"structured_{split}"] = open(os.path.join(args.output_dir, f"structured_{split}.jsonl"), "w")
@@ -663,6 +731,39 @@ def main():
     
     print(f"Starting generation...")
     print(f"Plan: {args.num_train} train, {args.num_val} val, {args.num_test} test per operation.")
+    
+    # Initialize vocab_map, vocab_size, CAR_TOKEN_ID (assuming these are global or defined here)
+    # This part of the code was not provided in the original context, but is implied by the edit.
+    # For the purpose of this edit, we'll assume a `vocab_map` and `config` object exist
+    # or are implicitly handled by the surrounding code not shown.
+    # We will insert the new logic as requested.
+    
+    # Placeholder for vocab_map and config if they are not global
+    # In a real scenario, these would be properly defined.
+    vocab_map = {} # Assuming this is defined globally or passed around
+    class Config:
+        def __init__(self, dataset_mode):
+            self.dataset_mode = dataset_mode
+    config = Config(dataset_mode) # Using the dataset_mode defined above
+    
+    vocab_size = 14  # 0..13 (vanilla only)
+    CAR_TOKEN_ID = None
+    
+    # BasicFour Concat mode: unique CAR tokens
+    if config.dataset_mode == "basicfour_concat":
+        # Add Operation-specific CAR tokens
+        # 14: <CAR_+>
+        # 15: <CAR_->
+        # 16: <CAR_*>
+        # 17: <CAR_/>
+        vocab_map['<CAR_+>'] = 18
+        vocab_map['<CAR_->'] = 19
+        vocab_map['<CAR_*>'] = 20
+        vocab_map['<CAR_/>'] = 21
+        vocab_size = 22
+        # We don't have a single CAR_TOKEN_ID anymore, but we can define a map or handle it per op
+        CAR_TOKENS = {'+': 18, '-': 19, '*': 20, '/': 21}
+        CAR_TOKEN_ID = None # Should not be used generically
     
     for op in OPS:
         sampler = Sampler(
@@ -779,7 +880,14 @@ def main():
     print("\nStarting Numpy Conversion...")
     for split in ["train", "val", "test"]:
         if len(data_buffer[split]) > 0:
-            process_and_save_split(data_buffer[split], args.output_dir, split, args.max_len)
+            process_and_save_split(
+                data_buffer[split], 
+                args.output_dir, 
+                split, 
+                args.max_len, 
+                dataset_mode=config.dataset_mode, # Use config wrapper we made
+                vocab_map=vocab_map
+            )
         else:
             print(f"Skipping {split}, no data.")
 

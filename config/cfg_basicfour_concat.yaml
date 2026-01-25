@@ -5,16 +5,16 @@ defaults:
 hydra:
   output_subdir: null
 
-# Data path (Dual Head dataset)
-data_paths: ['data/arithmetic_dual']
-data_paths_test: ['data/arithmetic_dual']
+# Data path (BasicFour Concat dataset)
+data_paths: ['data/basicfour_concat']
+data_paths_test: ['data/basicfour_concat']
 
 # We disable specific evaluators for now as they might expect specific metadata
 evaluators:
   - name: basicfour@BasicFourEvaluator
 
 # Dataset mode
-dataset_mode: "dual_head"
+dataset_mode: "basicfour_concat"
 digits: 32 # Upper bound for safety
 
 # Hyperparams - Training
@@ -39,12 +39,12 @@ puzzle_emb_lr: 0.0
 
 seed: 42
 min_eval_interval: 0
+max_len: 256  # Increased length for sequential carry
 
 project_name: "trm-dual"
-run_name: "basic_four_dual_head"
+run_name: "basicfour_concat"
 
-# Dual Head specific: Aux loss weight (lambda)
 arch:
-  carry_loss_weight: 0.5
+  carry_loss_weight: 1.0 # Not used in single head, but good to keep
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0

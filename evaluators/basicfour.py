@@ -23,7 +23,17 @@ class BasicFourEvaluator:
         self.vocab_map_inv[16] = '='
         self.vocab_map_inv[17] = 'R'
         self.vocab_map_inv[0] = 'PAD'
+        self.vocab_map_inv[0] = 'PAD'
         self.vocab_map_inv[1] = 'MASK'
+        
+        # BasicFour Concat tokens
+        # We can map them to explicit strings or special markers
+        self.vocab_map_inv[18] = '<CAR_+>'
+        self.vocab_map_inv[19] = '<CAR_->'
+        self.vocab_map_inv[20] = '<CAR_*>'
+        self.vocab_map_inv[21] = '<CAR_/>'
+
+        self.dataset_mode = kwargs.get("dataset_mode", "vanilla")
         
         # Per-operation counters
         self.reset_counters()
@@ -50,6 +60,8 @@ class BasicFourEvaluator:
                 char = self.vocab_map_inv[token]
                 if char in ('PAD', 'MASK'):
                     break  # Stop at padding/mask
+                if char.startswith('<CAR_'):
+                     break # Stop at CAR token (concat mode)
                 result += char
             else:
                 result += "?"

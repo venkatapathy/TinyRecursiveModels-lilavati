@@ -1,9 +1,0 @@
-{
-  "sequence_accuracy": 0.40925,
-  "overall_digit_accuracy": 0.74425,
-  "valid_examples": 4000,
-  "total_examples": 4000,
-  "overall_carry_accuracy": 0.8683509495574461,
-  "carry_sequence_accuracy": 0.755,
-  "results_by_length": {}
-}

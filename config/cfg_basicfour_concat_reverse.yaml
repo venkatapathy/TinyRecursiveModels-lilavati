@@ -16,12 +16,13 @@ evaluators:
 # Dataset mode
 dataset_mode: "basic_concat_reverse"
 digits: 32 # Upper bound for safety
+train_digits: 8
 
 # Hyperparams - Training
 global_batch_size: 256
 
-epochs: 100
-eval_interval: 1
+epochs: 50
+eval_interval: 5
 checkpoint_every_eval: False
 
 lr: 1e-4

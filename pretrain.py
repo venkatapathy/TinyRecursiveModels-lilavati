@@ -57,6 +57,7 @@ class PretrainConfig(pydantic.BaseModel):
     # Dataset mode
     dataset_mode: str = "vanilla"  # "vanilla", "lilavati1", "lilavati2", or "lilavati3"
     digits: int = 3
+    train_digits: int = 8
 
     # Hyperparams
     global_batch_size: int
@@ -230,6 +231,16 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
+def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+    return cosine_schedule_with_warmup_lr_lambda(
+        train_state.step,
+        base_lr=base_lr,
+        num_warmup_steps=config.lr_warmup_steps,
+        num_training_steps=train_state.total_steps,
+        min_ratio=config.lr_min_ratio
+    )
+
+
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
@@ -254,44 +265,101 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    torch.save(train_state, os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
 
 
+def load_train_state(config: PretrainConfig, train_state: TrainState):
+    if config.load_checkpoint is not None:
+        print(f"Loading train state from {config.load_checkpoint}")
+        loaded_state = torch.load(config.load_checkpoint, map_location="cuda", weights_only=False)
+
+        # Update current train_state with loaded values
+        train_state.step = loaded_state.step
+        train_state.total_steps = loaded_state.total_steps
+        train_state.model.load_state_dict(loaded_state.model.state_dict(), assign=True)
+
+        # Load optimizer states
+        for i, optim in enumerate(train_state.optimizers):
+            optim.load_state_dict(loaded_state.optimizers[i].state_dict())
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
 
         # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
-
-        # Resize and reset puzzle emb if needed
-        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
+        checkpoint = torch.load(config.load_checkpoint, map_location="cuda", weights_only=False)
         
-        # Check if model has puzzle_emb
-        has_puzzle_emb = hasattr(model.model, 'puzzle_emb') and model.model.puzzle_emb is not None
-        
-        if has_puzzle_emb:
-            expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
-            if puzzle_emb_name in state_dict:
-                puzzle_emb = state_dict[puzzle_emb_name]
-                if puzzle_emb.shape != expected_shape:
-                    print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
-                    # Re-initialize using mean
-                    state_dict[puzzle_emb_name] = (
-                        torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
-                    )
-        
-        model.load_state_dict(state_dict, assign=True)
+        # Check if it's a TrainState or a raw state_dict
+        if hasattr(checkpoint, "model"):
+            state_dict = checkpoint.model.state_dict()
+        elif isinstance(checkpoint, dict) and "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        else:
+            state_dict = checkpoint
 
+        # Handle torch.compile prefixing (_orig_mod.)
+        # If model is compiled but checkpoint is not, or vice versa
+        model_state_dict = model.state_dict()
+        new_state_dict = {}
+        
+        # Determine if current model is compiled
+        is_model_compiled = any(k.startswith("_orig_mod.") for k in model_state_dict.keys())
+        # Determine if checkpoint is compiled
+        is_ckpt_compiled = any(k.startswith("_orig_mod.") for k in state_dict.keys())
+        
+        print(f"Model compiled: {is_model_compiled}, Checkpoint compiled: {is_ckpt_compiled}")
 
-def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
-    return cosine_schedule_with_warmup_lr_lambda(
-        current_step=train_state.step,
-        base_lr=base_lr,
-        num_warmup_steps=round(config.lr_warmup_steps),
-        num_training_steps=train_state.total_steps,
-        min_ratio=config.lr_min_ratio
-    )
+        # Get all parameters and buffers for manual updates
+        model_params = dict(model.named_parameters())
+        model_buffers = dict(model.named_buffers())
+
+        matched_keys = []
+        mismatched_keys = []
+        skipped_keys = []
+
+        for k, v in state_dict.items():
+            new_k = k
+            if is_model_compiled and not is_ckpt_compiled:
+                new_k = "_orig_mod." + k
+            elif not is_model_compiled and is_ckpt_compiled:
+                new_k = k.replace("_orig_mod.", "")
+            
+            if new_k in model_state_dict:
+                if model_state_dict[new_k].shape == v.shape:
+                    new_state_dict[new_k] = v
+                    matched_keys.append(new_k)
+                else:
+                    # Size mismatch - handle manually
+                    print(f"DEBUG SIZE MISMATCH: {new_k}: ckpt {list(v.shape)} != model {list(model_state_dict[new_k].shape)}")
+                    mismatched_keys.append(new_k)
+                    with torch.no_grad():
+                        # Get the actual parameter or buffer object
+                        if new_k in model_params:
+                            target = model_params[new_k]
+                        elif new_k in model_buffers:
+                            target = model_buffers[new_k]
+                        else:
+                            continue
+                            
+                        # Copy overlapping part
+                        if target.ndim == 1:
+                            d0 = min(target.shape[0], v.shape[0])
+                            target[:d0].copy_(v[:d0])
+                        elif target.ndim == 2:
+                            d0 = min(target.shape[0], v.shape[0])
+                            d1 = min(target.shape[1], v.shape[1])
+                            target[:d0, :d1].copy_(v[:d0, :d1])
+            else:
+                skipped_keys.append(new_k)
+        
+        # Load the filtered and potentially remapped state dict
+        model.load_state_dict(new_state_dict, strict=False)
+        print(f"Successfully matched {len(matched_keys)} tensors.")
+        if mismatched_keys:
+             print(f"Partially loaded {len(mismatched_keys)} tensors due to size mismatch.")
+        if skipped_keys:
+             print(f"Skipped {len(skipped_keys)} tensors not in model state dict.")
+             if len(skipped_keys) < 20:
+                  print(f"Skipped keys: {skipped_keys}")
 
 
 def compute_carry_loss_weight(
@@ -331,6 +399,7 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
             cls = load_model_class(cfg.name, "evaluators.")(
                 data_path=data_path, eval_metadata=eval_metadata, 
                 dataset_mode=config.dataset_mode, digits=config.digits,
+                train_digits=config.train_digits,
                 **cfg.__pydantic_extra__
             )  # type: ignore
             evaluators.append(cls)

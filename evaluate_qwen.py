@@ -45,8 +45,12 @@ def evaluate_dataset(model, tokenizer, data_path, args, dataset_name, sample_tab
     
     correct = 0
     total = 0
-    by_op = {'+': {'correct': 0, 'total': 0}, '-': {'correct': 0, 'total': 0}, 
-             '*': {'correct': 0, 'total': 0}, '/': {'correct': 0, 'total': 0}}
+    by_op = {
+        '+': {'correct': 0, 'total': 0, 'digit_correct': 0, 'digit_total': 0}, 
+        '-': {'correct': 0, 'total': 0, 'digit_correct': 0, 'digit_total': 0}, 
+        '*': {'correct': 0, 'total': 0, 'digit_correct': 0, 'digit_total': 0}, 
+        '/': {'correct': 0, 'total': 0, 'digit_correct': 0, 'digit_total': 0}
+    }
     
     for line in tqdm(lines):
         item = json.loads(line)
@@ -77,38 +81,110 @@ def evaluate_dataset(model, tokenizer, data_path, args, dataset_name, sample_tab
         if is_correct:
             correct += 1
             
-        # Op detection
+        # ID vs OOD Split (Threshold 8 digits)
+        # Parse operands from item 'A' and 'B' if available, or infer from prompt?
+        # item is the source json object
+        len_a = len(str(item.get('A', '')))
+        len_b = len(str(item.get('B', '')))
+        max_digits = max(len_a, len_b)
+        
+        is_id = max_digits <= 8
+        
+        if is_id:
+            by_op[op]['id_total'] = by_op[op].get('id_total', 0) + 1
+            if is_correct:
+                by_op[op]['id_correct'] = by_op[op].get('id_correct', 0) + 1
+        else:
+            by_op[op]['ood_total'] = by_op[op].get('ood_total', 0) + 1
+            if is_correct:
+                by_op[op]['ood_correct'] = by_op[op].get('ood_correct', 0) + 1
+
+        # Digit-level accuracy (simple character match from right to left)
+        t_rev = target[::-1]
+        p_rev = prediction[::-1]
+        match_count = 0
+        max_len = max(len(t_rev), len(p_rev))
+        if max_len > 0:
+            for i in range(min(len(t_rev), len(p_rev))):
+                if t_rev[i] == p_rev[i]:
+                    match_count += 1
+        
+        # Track digit stats for ID/OOD
+        if is_id:
+             by_op[op]['id_digit_correct'] = by_op[op].get('id_digit_correct', 0) + match_count
+             by_op[op]['id_digit_total'] = by_op[op].get('id_digit_total', 0) + max_len
+        else:
+             by_op[op]['ood_digit_correct'] = by_op[op].get('ood_digit_correct', 0) + match_count
+             by_op[op]['ood_digit_total'] = by_op[op].get('ood_digit_total', 0) + max_len
+
         op = None
         if '+' in prompt: op = '+'
         elif '-' in prompt: op = '-'
         elif '*' in prompt: op = '*'
         elif '/' in prompt: op = '/'
         
-        if op:
+        if op and op in by_op:
             by_op[op]['total'] += 1
+            by_op[op]['digit_correct'] += match_count
+            by_op[op]['digit_total'] += max_len
             if is_correct:
                 by_op[op]['correct'] += 1
                 
         if args.verbose and total <= 5:
             print(f"[{dataset_name}] Prompt: {prompt} | Target: {target} | Pred: {prediction} [{'CORRECT' if is_correct else 'WRONG'}]")
         
-        if sample_table is not None and sample_table.data and len(sample_table.data) < 1000: # Global limit across datasets
-             # Log sample if total items logged < 1000 (roughly) or per dataset limit logic if preferred
-             # Here we just add to the table
+        if sample_table is not None and sample_table.data and len(sample_table.data) < 1000: 
              sample_table.add_data(dataset_name, prompt, target, generated_text, prediction, is_correct, op)
 
-    # Compute Metircs
+    # Compute Metrics
     metrics = {}
     overall_acc = correct/total if total > 0 else 0.0
     metrics[f"{dataset_name}/accuracy"] = overall_acc
     
+    # ID/OOD Aggregation
+    total_id_correct = sum(stats.get('id_correct', 0) for stats in by_op.values())
+    total_id_total = sum(stats.get('id_total', 0) for stats in by_op.values())
+    
+    total_ood_correct = sum(stats.get('ood_correct', 0) for stats in by_op.values())
+    total_ood_total = sum(stats.get('ood_total', 0) for stats in by_op.values())
+    
+    total_id_digit_correct = sum(stats.get('id_digit_correct', 0) for stats in by_op.values())
+    total_id_digit_total = sum(stats.get('id_digit_total', 0) for stats in by_op.values())
+    
+    total_ood_digit_correct = sum(stats.get('ood_digit_correct', 0) for stats in by_op.values())
+    total_ood_digit_total = sum(stats.get('ood_digit_total', 0) for stats in by_op.values())
+    
+    id_acc = total_id_correct / total_id_total if total_id_total > 0 else 0.0
+    ood_acc = total_ood_correct / total_ood_total if total_ood_total > 0 else 0.0
+    
+    id_digit_acc = total_id_digit_correct / total_id_digit_total if total_id_digit_total > 0 else 0.0
+    ood_digit_acc = total_ood_digit_correct / total_ood_digit_total if total_ood_digit_total > 0 else 0.0
+    
+    metrics[f"{dataset_name}/id_accuracy"] = id_acc
+    metrics[f"{dataset_name}/ood_accuracy"] = ood_acc
+    metrics[f"{dataset_name}/id_digit_accuracy"] = id_digit_acc
+    metrics[f"{dataset_name}/ood_digit_accuracy"] = ood_digit_acc
+
+    # Overall Digit Accuracy
+    total_digit_correct = sum(stats['digit_correct'] for stats in by_op.values())
+    total_digit_total = sum(stats['digit_total'] for stats in by_op.values())
+    overall_digit_acc = total_digit_correct / total_digit_total if total_digit_total > 0 else 0.0
+    metrics[f"{dataset_name}/digit_accuracy"] = overall_digit_acc
+    
     print(f"\nResults for {dataset_name}:")
     print(f"Overall Accuracy: {correct}/{total} = {overall_acc:.4f}")
+    print(f"ID Accuracy: {total_id_correct}/{total_id_total} = {id_acc:.4f}")
+    print(f"OOD Accuracy: {total_ood_correct}/{total_ood_total} = {ood_acc:.4f}")
 
     for op, stats in by_op.items():
         if stats['total'] > 0:
             op_acc = stats['correct']/stats['total']
-            print(f"Op {op}: {stats['correct']}/{stats['total']} = {op_acc:.4f}")
+            
+            # Op splits
+            op_id_acc = stats.get('id_correct', 0)/stats.get('id_total', 1) if stats.get('id_total', 0) > 0 else 0.0
+            op_ood_acc = stats.get('ood_correct', 0)/stats.get('ood_total', 1) if stats.get('ood_total', 0) > 0 else 0.0
+            
+            print(f"Op {op}: Seq={stats['correct']}/{stats['total']} ({op_acc:.4f}) | ID={op_id_acc:.4f} | OOD={op_ood_acc:.4f}")
             
             op_name = "unknown"
             if op == '+': op_name = "add"
@@ -117,7 +193,16 @@ def evaluate_dataset(model, tokenizer, data_path, args, dataset_name, sample_tab
             elif op == '/': op_name = "div"
             
             metrics[f"{dataset_name}/{op_name}_accuracy"] = op_acc
+            metrics[f"{dataset_name}/{op_name}_id_accuracy"] = op_id_acc
+            metrics[f"{dataset_name}/{op_name}_ood_accuracy"] = op_ood_acc
             metrics[f"{dataset_name}/{op_name}_count"] = stats['total']
+            
+    # Save to JSON
+    os.makedirs("results", exist_ok=True)
+    run_name = args.wandb_run_name if args.wandb_run_name else "qwen_eval"
+    # To handle multiple datasets in one run, we might overwrite or append.
+    # Ideally evaluators return metrics and the main loop saves them.
+    # But this function returns metrics. We can save in main loop.
             
     return metrics
 
@@ -146,21 +231,30 @@ def evaluate_qwen(args):
     
     for data_dir in args.data_dirs:
         # Determine dataset name
-        # If path ends with slash, dirname might be empty string depending on split
         clean_path = data_dir.rstrip('/')
         dataset_name = os.path.basename(clean_path)
-        if not dataset_name: # Handle root path case strictly
+        if not dataset_name: 
              dataset_name = "dataset"
              
         # Evaluate
         metrics = evaluate_dataset(model, tokenizer, data_dir, args, dataset_name, sample_table)
         all_metrics.update(metrics)
         
-    # Log all metrics
+    # Log all metrics to WandB
     if args.wandb_project:
         wandb.log(all_metrics)
         wandb.log({"samples": sample_table})
         wandb.finish()
+        
+    # Save to local JSON
+    os.makedirs("results", exist_ok=True)
+    run_name = args.wandb_run_name if args.wandb_run_name else "qwen_eval"
+    # slugify
+    run_name = run_name.replace("/", "_").replace(" ", "_")
+    output_file = os.path.join("results", f"{run_name}.json")
+    with open(output_file, "w") as f:
+        json.dump(all_metrics, f, indent=4)
+    print(f"Saved results to {output_file}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

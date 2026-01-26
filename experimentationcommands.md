@@ -80,6 +80,14 @@ python pretrain.py \
     data_paths_test=['data/icml/concat']
 ```
 
+## gemma
+python3 train_slm.py \
+    --config_path config/slm/gemma_270m_config.json \
+    --data_dir data/icml/vanilla \
+    --output_dir checkpoints/slm/gemma_270m_vanilla \
+    --run_name gemma_270m_vanilla_icml \
+    --wandb_project trm-arithmetic-icml
+
 # Evaluation
 ## qwen
 ```bash
@@ -96,28 +104,25 @@ python pretrain.py \
 ./venv/bin/python evaluate.py \
     --config-name cfg_vanilla \
     project_name=trm-icml-eval \
-    split=test
+    +split=test
 
 # ID Evaluation (Val Split)
 ./venv/bin/python evaluate.py \
     --config-name cfg_vanilla \
     project_name=trm-icml-eval \
-    split=val
+    +split=val
 ```
 
 ## TRM Concat
 ```bash
 # OOD Evaluation (Test Split)
-./venv/bin/python evaluate.py \
-    --config-name cfg_basicfour_concat \
-    project_name=trm-icml-eval \
-    split=test
+./venv/bin/python evaluate.py --config-name cfg_basicfour_concat project_name=trm-icml-eval +split=test +checkpoint_folder=checkpoints/trm-arthmetic-icml/basicfour_concat
 
 # ID Evaluation (Val Split)
 ./venv/bin/python evaluate.py \
     --config-name cfg_basicfour_concat \
     project_name=trm-icml-eval \
-    split=val
+    +split=val
 ```
 
 ## TRM Reverse
@@ -126,11 +131,14 @@ python pretrain.py \
 ./venv/bin/python evaluate.py \
     --config-name cfg_basicfour_concat_reverse \
     project_name=trm-icml-eval \
-    split=test
+    +split=test
 
 # ID Evaluation (Val Split)
 ./venv/bin/python evaluate.py \
     --config-name cfg_basicfour_concat_reverse \
     project_name=trm-icml-eval \
-    split=val
+    
 ```
+
+# Result Compilation
+python3 scripts/generate_table.py 

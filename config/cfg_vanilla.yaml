@@ -22,12 +22,13 @@ evaluators:
 # Dataset mode
 dataset_mode: "vanilla"
 digits: 32 # Maximum digits (global setting)
+train_digits: 8
 
 # Hyperparams - Training
 global_batch_size: 256
 
-epochs: 100
-eval_interval: 1
+epochs: 50
+eval_interval: 5
 checkpoint_every_eval: False
 
 # Optimizer

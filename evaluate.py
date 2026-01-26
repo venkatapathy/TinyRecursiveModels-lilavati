@@ -3,6 +3,7 @@ import os
 import hydra
 import torch
 import glob
+import copy
 from omegaconf import DictConfig, OmegaConf
 from dataset.common import PuzzleDatasetMetadata
 from pretrain import (
@@ -10,9 +11,14 @@ from pretrain import (
     create_dataloader,
     create_evaluators,
     init_train_state,
-    evaluate
+    evaluate,
+    TrainState
 )
 import wandb
+import sys
+
+# Hack to allow unpickling TrainState which was saved as __main__.TrainState in pretrain.py
+sys.modules['__main__'].TrainState = TrainState
 
 @hydra.main(config_path="config", config_name="cfg_dual_head", version_base=None)
 def main(cfg: DictConfig):
@@ -114,10 +120,58 @@ def main(cfg: DictConfig):
     ckpt_path = config.load_checkpoint
     
     if not ckpt_path:
-        possible_ckpts = glob.glob("outputs/**/last.ckpt", recursive=True)
-        possible_ckpts += glob.glob("checkpoints/**/*.ckpt", recursive=True)
-        possible_ckpts += glob.glob("checkpoints/**/step_*", recursive=True)
-        possible_ckpts += glob.glob("wandb/**/*last.ckpt", recursive=True)
+        # Search priority:
+        # 0. User specified checkpoint folder via +checkpoint_folder=...
+        # 1. Specific project checkpoint dir (checkpoints/trm-arthmetic-icml/<run_name>)
+        # 2. General output/checkpoints dirs
+        
+        # Check for user-provided checkpoint folder override
+        checkpoint_folder = None
+        for override in cfg.get("overrides", []):
+            if override.startswith("checkpoint_folder="):
+                checkpoint_folder = override.split("=")[1]
+        
+        if "checkpoint_folder" in cfg: # Also check if it's in the config object
+            checkpoint_folder = cfg.checkpoint_folder
+
+        possible_ckpts = []
+        
+        if checkpoint_folder:
+             print(f"Searching in user-specified folder: {checkpoint_folder}")
+             patterns = [f"{checkpoint_folder}/step_*", f"{checkpoint_folder}/*.ckpt"]
+             for pattern in patterns:
+                 possible_ckpts.extend(glob.glob(pattern, recursive=True))
+        
+        # If no checkpoint found in user-specified folder (or not specified), search in run-specific folder
+        if not possible_ckpts and config.run_name:
+            print(f"Searching for checkpoints matching run_name: {config.run_name}")
+            run_patterns = [
+                f"checkpoints/trm-arthmetic-icml/{config.run_name}/step_*",
+                f"checkpoints/trm-arthmetic-icml/{config.run_name}/*.ckpt"
+            ]
+            for pattern in run_patterns:
+                possible_ckpts.extend(glob.glob(pattern, recursive=True))
+                
+        # If still no checkpoints, search globally (fallback)
+        if not possible_ckpts:
+            print("No run-specific checkpoints found. Searching globally...")
+            fallback_patterns = [
+                "outputs/**/last.ckpt",
+                "checkpoints/**/*.ckpt",
+                "checkpoints/**/step_*",
+                "wandb/**/*last.ckpt"
+            ]
+            for pattern in fallback_patterns:
+                possible_ckpts.extend(glob.glob(pattern, recursive=True))
+
+        # Filter out 'evaluator_' directories which are just logs/results
+        possible_ckpts = [p for p in possible_ckpts if "evaluator_" not in p and not os.path.isdir(p) or "step_" in os.path.basename(p)]
+        
+        # If user specified a folder, strictly filter for that folder (already done by search but for safety)
+        if checkpoint_folder:
+             # Normalize path to handle trailing slashes etc.
+             norm_folder = os.path.normpath(checkpoint_folder)
+             possible_ckpts = [p for p in possible_ckpts if norm_folder in os.path.normpath(p)]
         
         # Sort by modification time
         possible_ckpts.sort(key=os.path.getmtime, reverse=True)
@@ -126,7 +180,8 @@ def main(cfg: DictConfig):
             ckpt_path = possible_ckpts[0]
             print(f"Found checkpoint: {ckpt_path}")
         else:
-            print("No checkpoint found! Using initialized random weights (Baseline).")
+            search_patterns = [f"checkpoints/trm-arthmetic-icml/{config.run_name}/step_*"] if config.run_name else ["checkpoints/**/step_*"]
+            raise ValueError(f"No checkpoint found! Searched patterns: {search_patterns}. Please specify +load_checkpoint=/path/to/ckpt")
     
     if ckpt_path:
         config.load_checkpoint = ckpt_path
@@ -212,8 +267,41 @@ def main(cfg: DictConfig):
             
             wandb.log(wandb_metrics)
             wandb.finish()
+            
+        # Save metrics to JSON locally for table generation
+        os.makedirs("results", exist_ok=True)
+        # Use run_name for filename, ensure it's safe
+        json_filename = f"{run_name}.json".replace("/", "_").replace(" ", "_")
+        json_path = os.path.join("results", json_filename)
+        
+        import json
+        import numpy as np
 
-if __name__ == "__main__":
-    main()
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                elif isinstance(obj, np.floating):
+                    return float(obj)
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super(NumpyEncoder, self).default(obj)
+
+        # We need to flatten the metrics if they are nested like {dataset: {metric: val}}
+        # Similar to wandb logic
+        flat_metrics = {}
+        for dataset, dataset_metrics in metrics.items():
+            prefix = f"{dataset}_{split_arg}"
+            if isinstance(dataset_metrics, dict):
+                for k, v in dataset_metrics.items():
+                    flat_metrics[f"{prefix}/{k}"] = v
+            else:
+                flat_metrics[prefix] = dataset_metrics
+                
+        with open(json_path, "w") as f:
+            json.dump(flat_metrics, f, indent=4, cls=NumpyEncoder)
+
+        print(f"Saved results to {json_path}")
+
 if __name__ == "__main__":
     main()

@@ -8,12 +8,12 @@ hydra:
   output_subdir: null
 
 # Project info
-project_name: trm-dual
-run_name: basic_four_vanilla
+project_name: trm-arthmetic-icml
+run_name: basicfour_vanilla
 
 # Data Path (Using the same dual_head dataset which is compatible)
-data_paths: ['data/arithmetic_dual']
-data_paths_test: ['data/arithmetic_dual']
+data_paths: ['data/icml/vanilla']
+data_paths_test: ['data/icml/vanilla']
 
 # Evaluators
 evaluators:

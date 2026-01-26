@@ -6,8 +6,8 @@ hydra:
   output_subdir: null
 
 # Data path (BasicFour Concat dataset)
-data_paths: ['data/basicfour_concat']
-data_paths_test: ['data/basicfour_concat']
+data_paths: ['data/icml/concat']
+data_paths_test: ['data/icml/concat']
 
 # We disable specific evaluators for now as they might expect specific metadata
 evaluators:
@@ -41,7 +41,7 @@ seed: 42
 min_eval_interval: 0
 max_len: 256  # Increased length for sequential carry
 
-project_name: "trm-dual"
+project_name: "trm-arthmetic-icml"
 run_name: "basicfour_concat"
 
 arch:

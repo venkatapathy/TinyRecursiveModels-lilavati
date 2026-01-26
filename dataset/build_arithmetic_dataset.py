@@ -48,7 +48,8 @@ VOCAB_MAP = {
     '0': 2, '1': 3, '2': 4, '3': 5, '4': 6,
     '5': 7, '6': 8, '7': 9, '8': 10, '9': 11,
     '+': 12, '-': 13, '*': 14, '/': 15, '=': 16,
-    'R': 17
+    'R': 17,
+    '<RES>': 22
 }
 PAD_ID = 0
 IGNORE_LABEL_ID = -100
@@ -475,7 +476,7 @@ class Sampler:
 # Conversion & Saving Logic
 # -----------------------------------------------------------------------------
 
-def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: str, max_len: int, dataset_mode: str = "vanilla", vocab_map: Dict = None):
+def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: str, max_len: int, dataset_mode: str = "vanilla", vocab_map: Dict = None, vocab_size: int = 22):
     """
     Converts structured data items to padded numpy arrays and saves them.
     """
@@ -512,6 +513,8 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
                  # Fallback or error?
                  # Should fail if map is correct.
                  raise ValueError(f"Missing CAR token for op {op}")
+            
+            res_token_id = vocab_map.get('<RES>')
             
             # 2. Get Intermediate Data
             # Note: We need digits as strings/ids, not raw ints 0-9 usually? 
@@ -603,10 +606,15 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
         # CAUSAL LM SHIFTING
         full_ids = prompt_ids + result_ids + concat_suffix_ids
         if dataset_mode == "basic_concat_reverse":
-            full_ids = prompt_ids + concat_suffix_ids + result_ids
+            full_ids = prompt_ids + concat_suffix_ids + [res_token_id] + result_ids
         
         # Update input_ids to match the reordered full_ids
         input_ids = full_ids
+        
+        # Resync aux_labels length (since we might have added RES token)
+        if len(aux_labels) != len(input_ids):
+             # For basicfour modes, aux_labels are all IGNORE anyway
+             aux_labels = [IGNORE_LABEL_ID] * len(input_ids)
         
         shifted_lm_labels = full_ids[1:] + [PAD_ID]
         
@@ -670,7 +678,7 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
     metadata = {
         "seq_len": max_len,
         "seq_len": max_len,
-        "vocab_size": 22,
+        "vocab_size": vocab_size,
         "pad_id": PAD_ID,
         "pad_id": PAD_ID,
         "ignore_label_id": IGNORE_LABEL_ID,
@@ -701,7 +709,7 @@ def main():
     parser.add_argument("--train_max_result_digits", type=int, default=8)
     parser.add_argument("--test_max_result_digits", type=int, default=12)
     parser.add_argument("--allow_zero", action="store_true", help="Allow 0 operands")
-    parser.add_argument("--max_len", type=int, default=64, help="Padded sequence length")
+    parser.add_argument("--max_len", type=int, required=True, help="Padded sequence length (e.g., 256 for 32-digit ops)")
     parser.add_argument("--dataset_mode", type=str, default="basicfour_concat", choices=["vanilla", "lilavati1", "lilavati2", "lilavati3", "basicfour_concat", "basic_concat_reverse"], help="Dataset mode")
     
     args = parser.parse_args()
@@ -752,7 +760,7 @@ def main():
             self.dataset_mode = dataset_mode
     config = Config(dataset_mode) # Using the dataset_mode defined above
     
-    vocab_size = 14  # 0..13 (vanilla only)
+    vocab_size = 17  # 0..16 (vanilla: max token is '=' at 16)
     CAR_TOKEN_ID = None
     
     # BasicFour Concat mode: unique CAR tokens
@@ -766,10 +774,13 @@ def main():
         vocab_map['<CAR_->'] = 19
         vocab_map['<CAR_*>'] = 20
         vocab_map['<CAR_/>'] = 21
-        vocab_size = 22
+        vocab_map['<RES>'] = 22
+        vocab_size = 23
         # We don't have a single CAR_TOKEN_ID anymore, but we can define a map or handle it per op
         CAR_TOKENS = {'+': 18, '-': 19, '*': 20, '/': 21}
         CAR_TOKEN_ID = None # Should not be used generically
+        # Add RES token if needed (ID 22) - already in VOCAB_MAP globally but we need to account for it in size
+        vocab_size = 23 # 0..22
     
     for op in OPS:
         sampler = Sampler(
@@ -892,7 +903,8 @@ def main():
                 split, 
                 args.max_len, 
                 dataset_mode=config.dataset_mode, # Use config wrapper we made
-                vocab_map=vocab_map
+                vocab_map=vocab_map,
+                vocab_size=vocab_size
             )
         else:
             print(f"Skipping {split}, no data.")

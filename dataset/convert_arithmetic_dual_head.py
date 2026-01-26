@@ -235,7 +235,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", type=str, required=True, help="Directory containing structured_*.jsonl")
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--max_len", type=int, default=64, help="Maximum sequence length")
+    parser.add_argument("--max_len", type=int, required=True, help="Maximum sequence length")
     args = parser.parse_args()
     
     for split in ["train", "val", "test"]:

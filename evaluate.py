@@ -12,6 +12,7 @@ from pretrain import (
     init_train_state,
     evaluate
 )
+import wandb
 
 @hydra.main(config_path="config", config_name="cfg_dual_head", version_base=None)
 def main(cfg: DictConfig):
@@ -25,19 +26,80 @@ def main(cfg: DictConfig):
     print("      TRM EVALUATION MODE (32-digit OOD)")
     print("="*50 + "\n")
     
-    # Override Data Path to 32-digit OOD
-    ood_path = "data/arithmetic_32"
-    if os.path.exists(ood_path):
-        print(f"Loading OOD Data from: {ood_path}")
-        config.data_paths_test = [ood_path]
-    else:
-        print(f"Warning: {ood_path} not found, using default: {config.data_paths_test}")
+    # Override Data Path based on split
+    # Default behavior: use OOD (test) path if split is not specified or "test"
+    # If split is "val", use ID (val) path (which is same as train path usually, but we want val set)
+    
+    # Check for split argument in overrides
+    split_arg = "test"
+    for override in cfg.get("overrides", []):
+        if override.startswith("split="):
+            split_arg = override.split("=")[1]
+            
+    # Also check cfg itself if added to config
+    if "split" in cfg:
+        split_arg = cfg.split
 
-    # Create Loader (Test Split)
+    print(f"Evaluation Split: {split_arg.upper()}")
+    
+    # Logic:
+    # If split="val": usage ID data (data_paths). Loader will load "val" split.
+    # If split="test": usage OOD data (data_paths_test). Loader will load "test" split.
+    
+    target_data_paths = config.data_paths
+    dataset_split = "val"
+    
+    if split_arg == "test":
+        target_data_paths = config.data_paths_test
+        dataset_split = "test" 
+    elif split_arg == "val":
+        target_data_paths = config.data_paths # ID data
+        dataset_split = "val"
+        # Ensure we are pointing to the right place for ID val
+        # Usually data_paths points to the folder containing train/val/test for ID
+    
+    # Update config to use the selected paths
+    # We cheat a bit: we set data_paths_test to the target paths so create_dataloader(..., split="test") works generic
+    # OR we just call create_dataloader with the correct split and paths manually.
+    
+    # Let's verify paths exist
+    final_paths = []
+    for p in target_data_paths:
+        if os.path.exists(p):
+            final_paths.append(p)
+        else:
+            print(f"Warning: Path {p} not found.")
+            
+    if not final_paths:
+        print("No valid data paths found!")
+        return
+
+    print(f"Loading Data from: {final_paths}")
+
+    # Create Loader
+    # We invoke create_dataloader. Note: pretrain.py's create_dataloader logic for "test" split uses data_paths_test.
+    # We want to force it to use our `final_paths`.
+    # We can perform a temporary patch on config.
+    
+    config_for_loader = copy.deepcopy(config)
+    config_for_loader.data_paths_test = final_paths
+    
     try:
+        # We always verify against the requested split ("test" or "val")
+        # But `create_dataloader` with split="test" uses `data_paths_test`.
+        # If we want to evaluate on "val" split of ID data, we should pass split="val" 
+        # AND ensure the loader uses the correct paths.
+        # pretrain.py:109: dataset_paths=config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths
+        
+        # So:
+        # if split="test": loader uses config.data_paths_test (which we set to final_paths)
+        # if split="val": loader uses config.data_paths. We should set config.data_paths = final_paths to be sure.
+        
+        config_for_loader.data_paths = final_paths
+        
         eval_loader, eval_metadata = create_dataloader(
-            config, 
-            "test", 
+            config_for_loader, 
+            dataset_split, 
             test_set_mode=True, 
             epochs_per_iter=1, 
             global_batch_size=config.global_batch_size, 
@@ -48,45 +110,64 @@ def main(cfg: DictConfig):
         print(f"Error creating dataloader: {e}")
         return
 
-    # Find Checkpoint
-    # Default to finding the latest in outputs/ or checkpoints/
-    # Logic: If cfg.checkpoint_path is set, use it. Else search.
-    # The user is running from current dir.
+    # Find Checkpoint ... (rest is same, but we search for checkpoint only if not provided)
+    ckpt_path = config.load_checkpoint
     
-    ckpt_path = None
-    
-    # Heuristic: Search recursively for 'last.ckpt' in 'outputs/' folder (Hydra default) 
-    # or the user-specific 'checkpoints' folder.
-    # But pretrain.py saves to `checkpoints/Project/RunName/Step...`
-    # Let's check common locations.
-    
-    possible_ckpts = glob.glob("outputs/**/last.ckpt", recursive=True)
-    possible_ckpts += glob.glob("checkpoints/**/*.ckpt", recursive=True)
-    possible_ckpts += glob.glob("wandb/**/*last.ckpt", recursive=True)
-    
-    # Sort by modification time
-    possible_ckpts.sort(key=os.path.getmtime, reverse=True)
-    
-    if len(possible_ckpts) > 0:
-        ckpt_path = possible_ckpts[0]
-        print(f"Found checkpoint: {ckpt_path}")
-    else:
-        print("No checkpoint found! Using initialized random weights (Baseline).")
+    if not ckpt_path:
+        possible_ckpts = glob.glob("outputs/**/last.ckpt", recursive=True)
+        possible_ckpts += glob.glob("checkpoints/**/*.ckpt", recursive=True)
+        possible_ckpts += glob.glob("checkpoints/**/step_*", recursive=True)
+        possible_ckpts += glob.glob("wandb/**/*last.ckpt", recursive=True)
+        
+        # Sort by modification time
+        possible_ckpts.sort(key=os.path.getmtime, reverse=True)
+        
+        if len(possible_ckpts) > 0:
+            ckpt_path = possible_ckpts[0]
+            print(f"Found checkpoint: {ckpt_path}")
+        else:
+            print("No checkpoint found! Using initialized random weights (Baseline).")
     
     if ckpt_path:
-        config.resume_from = ckpt_path
+        config.load_checkpoint = ckpt_path
 
     # Initialize Model & State
     train_state = init_train_state(config, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
     
-    # Create Evaluators
-    evaluators = create_evaluators(config, eval_metadata)
+    # Create Evaluators - pass the updated config so they know which paths to use if they look at it
+    # But usually evaluators just use metadata.
+    # Note: create_evaluators might prefer `data_paths` or `data_paths_test`.
+    # Let's pass the modified config.
+    evaluators = create_evaluators(config_for_loader, eval_metadata)
     
     if not evaluators:
         print("No evaluators configured!")
         return
         
-    print(f"Running {len(evaluators)} Evaluators...")
+    # Initialize WandB
+    if config.project_name:
+        wandb_config = config.model_dump()
+        wandb_config.update({
+            "model": "TRM",
+            "variant": config.dataset_mode,
+            "digits": config.digits,
+            "eval_only": True,
+            "split": split_arg
+        })
+        run_name = config.run_name
+        if not run_name:
+            run_name = f"eval_{config.dataset_mode}_{split_arg}"
+        else:
+            run_name = f"{run_name}_{split_arg}"
+            
+        wandb.init(
+            project=config.project_name, 
+            name=run_name, 
+            config=wandb_config,
+            settings=wandb.Settings(_disable_stats=True)
+        )
+
+    print(f"Running {len(evaluators)} Evaluators on {dataset_split.upper()} split...")
     
     # Evaluation Loop
     train_state.model.eval()
@@ -117,6 +198,22 @@ def main(cfg: DictConfig):
                     print(f"{prefix}{k}: {v}")
         
         print_metrics(metrics)
+        
+        # Log to WandB
+        if config.project_name:
+            wandb_metrics = {}
+            for dataset, dataset_metrics in metrics.items():
+                prefix = f"{dataset}_{split_arg}" # Distinguish val vs test in logs
+                if isinstance(dataset_metrics, dict):
+                    for k, v in dataset_metrics.items():
+                        wandb_metrics[f"{prefix}/{k}"] = v
+                else:
+                    wandb_metrics[prefix] = dataset_metrics
+            
+            wandb.log(wandb_metrics)
+            wandb.finish()
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()

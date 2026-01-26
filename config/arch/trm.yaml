@@ -1,0 +1,45 @@
+# Tiny Recursive Model (TRM) Architecture Config
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: softmax_cross_entropy
+
+_target_: models.recursive_reasoning.trm.TinyRecursiveReasoningModel_ACTV1
+
+# These parameters are passed to TinyRecursiveReasoningModel_ACTV1Config
+# vocab_size and num_puzzle_identifiers are injected by pretrain.py
+# batch_size and seq_len are also injected.
+
+
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
+
+# Recursion Depth
+H_cycles: 1
+L_cycles: 4
+
+# Layer Counts
+H_layers: 1 
+L_layers: 2
+
+# Transformer Dimensions
+hidden_size: 384
+expansion: 2.666
+num_heads: 6
+pos_encodings: "rope"
+
+rms_norm_eps: 1e-5
+rope_theta: 10000.0
+
+# Halting / ACT
+halt_max_steps: 1
+halt_exploration_prob: 0.05
+
+forward_dtype: "bfloat16"
+
+mlp_t: False
+no_ACT_continue: True
+
+# Dataset specific defaults (can be overridden by main config)
+# dataset_mode and digits are injected by pretrain.py
+carry_loss_weight: 1.0

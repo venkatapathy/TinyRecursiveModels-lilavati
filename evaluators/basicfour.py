@@ -61,7 +61,10 @@ class BasicFourEvaluator:
                 if char in ('PAD', 'MASK'):
                     break  # Stop at padding/mask
                 if char.startswith('<CAR_'):
-                     break # Stop at CAR token (concat mode)
+                    if self.dataset_mode == "basic_concat_reverse":
+                        continue # Skip marker, continue reading (Trace + Result)
+                    else:
+                        break # Stop at CAR token (standard concat mode stops here)
                 result += char
             else:
                 result += "?"
@@ -158,7 +161,18 @@ class BasicFourEvaluator:
                 continue
             
             # Compare
-            if pred_str == expected:
+            matched = False
+            if self.dataset_mode == "basic_concat_reverse":
+                # In reverse mode, output is Trace + Result.
+                # Since we don't have a separator, we check if the output *ends with* the expected result.
+                # This approximates checking "Trace followed by Result".
+                if pred_str.endswith(expected):
+                    matched = True
+            else:
+                if pred_str == expected:
+                    matched = True
+            
+            if matched:
                 self.correct += 1
                 self.op_correct[op] += 1
                 

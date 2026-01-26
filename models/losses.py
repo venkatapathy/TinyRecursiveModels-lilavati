@@ -21,21 +21,32 @@ def log_stablemax(x, dim=-1):
     return torch.log(s_x/torch.sum(s_x, dim=dim, keepdim=True))
 
 
-def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
+def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None, **kwargs):
     logprobs = log_stablemax(logits.to(torch.float64), dim=-1)
 
     if valid_mask is None:
         valid_mask = (labels != ignore_index)
     transformed_labels = torch.where(valid_mask, labels, 0)
     prediction_logprobs = torch.gather(logprobs, index=transformed_labels.to(torch.long).unsqueeze(-1), dim=-1).squeeze(-1)
+    
+    if kwargs:
+         print(f"ANTIGRAVITY DEBUG: stablemax_cross_entropy received unexpected kwargs: {list(kwargs.keys())}")
 
     return -torch.where(valid_mask, prediction_logprobs, 0)
 
 
-def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
+def softmax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None, **kwargs):
     # Cast logits to f32
     # Flatten logits
-    return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
+    loss = F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
+    
+    if valid_mask is not None:
+        loss = torch.where(valid_mask, loss, torch.zeros_like(loss))
+        
+    if kwargs:
+        print(f"ANTIGRAVITY DEBUG: softmax_cross_entropy received unexpected kwargs: {list(kwargs.keys())}")
+        
+    return loss
 
 
 CAR_TOKEN_ID = 14  # <CAR> token for addition lilavati modes
@@ -47,7 +58,15 @@ class ACTLossHead(nn.Module):
     def __init__(self, model: nn.Module, loss_type: str, dataset_mode: str = "vanilla", digits: int = 3, carry_loss_weight: float = 1.0):
         super().__init__()
         self.model = model
+        print(f"ANTIGRAVITY DEBUG: ACTLossHead initializing with loss_type='{loss_type}'")
+        if loss_type not in globals():
+             print(f"ANTIGRAVITY DEBUG: loss_type '{loss_type}' NOT FOUND in globals! Globals keys: {list(globals().keys())}")
+             # Fallback or error? defaulting to softmax_cross_entropy if missing?
+             # For now let it crash or pick it up if I handle it.
+        
         self.loss_fn = globals()[loss_type]
+        print(f"ANTIGRAVITY DEBUG: self.loss_fn assigned to: {self.loss_fn}")
+        
         self.dataset_mode = dataset_mode
         self.digits = digits
         self.carry_loss_weight = carry_loss_weight

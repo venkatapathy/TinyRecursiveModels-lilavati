@@ -1,0 +1,54 @@
+# for 100k
+# Vanilla
+python dataset/build_arithmetic_dataset.py \
+    --output_dir data/icml/vanilla \
+    --dataset_mode vanilla \
+    --num_train 100000 --num_val 1000 --num_test 10000 \
+    --train_max_result_digits 8 \
+    --test_max_result_digits 32 \
+    --seed 42
+# Concat
+python dataset/build_arithmetic_dataset.py \
+    --output_dir data/icml/concat \
+    --dataset_mode basicfour_concat \
+    --num_train 100000 --num_val 1000 --num_test 10000 \
+    --train_max_result_digits 8 \
+    --test_max_result_digits 32 \
+    --seed 42
+# Reverse
+python dataset/build_arithmetic_dataset.py \
+    --output_dir data/icml/reverse \
+    --dataset_mode basic_concat_reverse \
+    --num_train 100000 --num_val 1000 --num_test 10000 \
+    --train_max_result_digits 8 \
+    --test_max_result_digits 32 \
+    --seed 42
+
+
+
+#reverse
+python pretrain.py \
+    --config-name cfg_basicfour_concat_reverse \
+    project_name=trm-arthmetic-icml \
+    data_paths=['data/icml/reverse'] \
+    data_paths_test=['data/icml/reverse']
+
+
+# Vanilla
+python pretrain.py \
+    --config-name cfg_vanilla \
+    project_name=trm-arthmetic-icml \
+    data_paths=['data/icml/vanilla'] \
+    data_paths_test=['data/icml/vanilla']
+# Concat
+python pretrain.py \
+    --config-name cfg_basicfour_concat \
+    project_name=trm-arthmetic-icml \
+    data_paths=['data/icml/concat'] \
+    data_paths_test=['data/icml/concat']
+
+
+#qwen
+python evaluate_qwen.py \
+    --data_dir data/icml/reverse \
+   --verbose

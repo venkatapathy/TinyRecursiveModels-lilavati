@@ -505,7 +505,7 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
         
         # BASICFOUR CONCAT LOGIC
         concat_suffix_ids = []
-        if dataset_mode == "basicfour_concat":
+        if dataset_mode in ["basicfour_concat", "basic_concat_reverse"]:
             # 1. Determine CAR token
             car_token_id = vocab_map.get(f"<CAR_{op}>")
             if car_token_id is None:
@@ -569,7 +569,7 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
         
         # Aux Labels: IGNORE on Prompt, Carry ids on Result
         inter_list = []
-        if dataset_mode != "basicfour_concat":
+        if dataset_mode not in ["basicfour_concat", "basic_concat_reverse"]:
             if op == '+':
                 inter_list = item["labels"].get("add_carry", [])
             elif op == '-':
@@ -602,6 +602,12 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
         
         # CAUSAL LM SHIFTING
         full_ids = prompt_ids + result_ids + concat_suffix_ids
+        if dataset_mode == "basic_concat_reverse":
+            full_ids = prompt_ids + concat_suffix_ids + result_ids
+        
+        # Update input_ids to match the reordered full_ids
+        input_ids = full_ids
+        
         shifted_lm_labels = full_ids[1:] + [PAD_ID]
         
         # Masking Prompt (Keep only the '=' prediction which is Result[0])
@@ -696,7 +702,7 @@ def main():
     parser.add_argument("--test_max_result_digits", type=int, default=12)
     parser.add_argument("--allow_zero", action="store_true", help="Allow 0 operands")
     parser.add_argument("--max_len", type=int, default=64, help="Padded sequence length")
-    parser.add_argument("--dataset_mode", type=str, default="basicfour_concat", choices=["vanilla", "lilavati1", "lilavati2", "lilavati3", "basicfour_concat"], help="Dataset mode")
+    parser.add_argument("--dataset_mode", type=str, default="basicfour_concat", choices=["vanilla", "lilavati1", "lilavati2", "lilavati3", "basicfour_concat", "basic_concat_reverse"], help="Dataset mode")
     
     args = parser.parse_args()
     
@@ -750,7 +756,7 @@ def main():
     CAR_TOKEN_ID = None
     
     # BasicFour Concat mode: unique CAR tokens
-    if config.dataset_mode == "basicfour_concat":
+    if config.dataset_mode in ["basicfour_concat", "basic_concat_reverse"]:
         # Add Operation-specific CAR tokens
         # 14: <CAR_+>
         # 15: <CAR_->

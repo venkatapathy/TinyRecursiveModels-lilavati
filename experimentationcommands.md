@@ -98,6 +98,16 @@ python3 train_slm.py \
     --wandb_run_name "Qwen2.5-Math-1.5B-Instruct-Vanilla"
 ```
 
+## gemma
+```bash
+./venv/bin/python evaluate_qwen.py \
+    --model checkpoints/slm/gemma_270m_vanilla/final \
+    --data_dirs data/icml/vanilla \
+    --verbose \
+    --wandb_project trm-icml-eval \
+    --wandb_run_name "Gemma-270M-Vanilla-SLM"
+```
+
 ## TRM Vanilla
 ```bash
 # OOD Evaluation (Test Split)

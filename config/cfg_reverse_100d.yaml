@@ -1,0 +1,50 @@
+defaults:
+  - arch: trm
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Separate Data path for 100-digit experiment
+data_paths: ['data/reverse_100d']
+data_paths_test: ['data/reverse_100d']
+
+evaluators:
+  - name: basicfour@BasicFourEvaluator
+
+# Dataset mode
+dataset_mode: "basic_concat_reverse"
+digits: 100 # OOD limit
+train_digits: 8 # Training limit
+
+# Hyperparams - Training
+global_batch_size: 256
+epochs: 50
+eval_interval: 5
+checkpoint_every_eval: True
+
+lr: 1e-4
+lr_min_ratio: 0.01
+lr_warmup_steps: 100
+grad_clip: 1.0
+
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+puzzle_emb_lr: 0.0
+puzzle_emb_weight_decay: 0.0
+
+# Separate Checkpoint path
+checkpoint_path: "checkpoints/reverse_100d"
+
+seed: 42
+min_eval_interval: 0
+max_len: 512
+
+project_name: "reverse_100d_experiment"
+run_name: "reverse_100d_run"
+
+arch:
+  carry_loss_weight: 1.0
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0

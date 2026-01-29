@@ -10,68 +10,104 @@ This repository contains the code for the ICML submission "Tiny Recursive Models
    pip install -r requirements.txt
    ```
 
-## Dataset Generation
+# Tiny Recursive Models (ICML Submission)
 
-This project uses procedural arithmetic datasets. You need to generate them before training.
+This repository contains the code for the ICML submission "Tiny Recursive Models".
 
-### 1. BasicFour Concat Dataset
-This dataset is used for the `basicfour_concat` experiment (Chain-of-Thought style serialization).
+## Installation
+
+1. Clone the repository.
+2. Install the dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Reproduction of Experimental Results
+
+Follow these steps to reproduce the results presented in the paper.
+
+### 1. Dataset Generation
+
+Generate the four distinct procedural arithmetic datasets required for the experiments:
+
 ```bash
+# 1. Vanilla Dataset (for NS models)
 python3 dataset/build_arithmetic_dataset.py \
-    --output_dir data/basicfour_concat \
-    --dataset_mode basicfour_concat \
-    --num_train 100000 --num_val 1000 --num_test 1000 \
-    --train_max_result_digits 8 --test_max_result_digits 32 \
-    --max_len 256
-```
-
-### 2. Dual Head / Vanilla Dataset
-This dataset contains auxiliary supervision labels and is used for both `dual_head` (multi-task) and `vanilla` experiments.
-```bash
-python3 dataset/build_arithmetic_dataset.py \
-    --output_dir data/arithmetic_dual \
+    --output_dir data/icml/vanilla \
     --dataset_mode vanilla \
-    --num_train 100000 --num_val 1000 --num_test 1000 \
+    --num_train 100000 --num_val 1000 --num_test 10000 \
     --train_max_result_digits 8 --test_max_result_digits 32 \
-### 3. Reverse Dataset
-This dataset reverses the input operands for specific experiments (`basic_concat_reverse`).
-```bash
+    --seed 42
+
+# 2. Concat Dataset (for OS-After models)
 python3 dataset/build_arithmetic_dataset.py \
-    --output_dir data/reverse \
-    --dataset_mode basic_concat_reverse \
-    --num_train 100000 --num_val 1000 --num_test 1000 \
+    --output_dir data/icml/concat \
+    --dataset_mode basicfour_concat \
+    --num_train 100000 --num_val 1000 --num_test 10000 \
     --train_max_result_digits 8 --test_max_result_digits 32 \
-    --max_len 256
+    --seed 42
+
+# 3. Reverse Dataset (for OS-Before models)
+python3 dataset/build_arithmetic_dataset.py \
+    --output_dir data/icml/reverse \
+    --dataset_mode basic_concat_reverse \
+    --num_train 100000 --num_val 1000 --num_test 10000 \
+    --train_max_result_digits 8 --test_max_result_digits 32 \
+    --seed 42
+
+# 4. Extended (100-digit) Dataset
+python3 dataset/build_arithmetic_dataset.py \
+    --output_dir data/reverse_100d \
+    --dataset_mode basic_concat_reverse \
+    --num_train 100000 --num_val 1000 --num_test 10000 \
+    --train_max_result_digits 8 --test_max_result_digits 100 \
+    --seed 42
 ```
 
-## Training
+### 2. Model Training
 
-### Train BasicFour Concat
+Train the model variants using the provided Hydra configurations. Ensure `data_paths` in the configs match your generated data directories.
+
+| Paper Model Name | Config File | Command |
+| :--- | :--- | :--- |
+| **TRM (NS)** | `cfg_vanilla` | `python pretrain.py --config-name cfg_vanilla` |
+| **TRM (OS-After)** | `cfg_basicfour_concat` | `python pretrain.py --config-name cfg_basicfour_concat` |
+| **TRM (OS-Before)** | `cfg_basicfour_concat_reverse` | `python pretrain.py --config-name cfg_basicfour_concat_reverse` |
+| **Transformer (NS)** | `cfg_transformer_300k` | `python pretrain.py --config-name cfg_transformer_300k` |
+| **Transformer (OS-Before)** | `cfg_transformer_300k_concat_reverse` | `python pretrain.py --config-name cfg_transformer_300k_concat_reverse` |
+| **Transformer (40x)** | `cfg_transformer_1000k` | `python pretrain.py --config-name cfg_transformer_1000k` |
+| **TRM (OS-Before-100d)** | `cfg_reverse_100d` | `python pretrain.py --config-name cfg_reverse_100d` |
+
+### 3. Evaluation
+
+Evaluate the trained checkpoints on the OOD (test) sets.
+
+#### TRM and Transformer Baselines
 ```bash
-python3 pretrain.py config=cfg_basicfour_concat
+# Example for TRM (OS-Before)
+python evaluate.py --config-name cfg_basicfour_concat_reverse +split=test
 ```
 
-### Train Dual Head
+#### Large-Scale Baselines (Qwen / Gemma)
 ```bash
-python3 pretrain.py config=cfg_dual_head
+# Qwen 2.5 Math (1.5B)
+python evaluate_qwen.py --data_dirs data/icml/vanilla --wandb_run_name "Qwen2.5-Math-1.5B-Instruct"
+
+# Gemma 270M (NS)
+python train_slm.py --config_path config/slm/gemma_270m_config.json --data_dir data/icml/vanilla ...
+python evaluate_qwen.py --model checkpoints/slm/gemma_270m_vanilla/final --data_dirs data/icml/vanilla
 ```
 
-### Train Vanilla
+### 4. Generating Tables and Plots
+
+Once evaluations are complete and metrics are saved in the `results/` directory, generate the LaTeX tables and accuracy plots:
+
 ```bash
-python3 pretrain.py config=cfg_vanilla
-### Train Reverse
-```bash
-python3 pretrain.py config=cfg_basicfour_concat_reverse
+python3 scripts/generate_table.py
 ```
 
-## Evaluation
-
-To evaluate a trained model:
-```bash
-python3 evaluate.py --model_path outputs/<run_name>/checkpoints/last.pt --dataset_path data/basicfour_concat/test
-```
-### Qwen Evaluation
-To evaluate using the Qwen-based evaluation script:
-```bash
-python3 evaluate_qwen.py --data_dir data/reverse --verbose
-```
+The following files will be created in the `results/` folder:
+- `addition_results_table_generated.tex` (Table 1)
+- `digit_wise_results_table.tex` (Table 2)
+- `carry_accuracy_table.tex` (Table 3)
+- `digit_wise_accuracy.png` (Accuracy vs. Problem Length plot)

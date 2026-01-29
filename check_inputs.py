@@ -34,7 +34,7 @@ def check_dataset(path, split, vocab_size):
         except Exception as e:
             print(f"    Error reading {f}: {e}")
 
-base_path = "/home/venkat/TinyRecursiveModels-lilavati/data/icml/vanilla"
+base_path = "data/icml/vanilla"
 vocab_size = 17
 
 check_dataset(base_path, "train", vocab_size)

@@ -1,0 +1,49 @@
+# Config for Standard Transformer Baseline Training
+defaults:
+  - arch: transformer
+  - _self_
+
+# Hydra setup
+hydra:
+  output_subdir: null
+
+# Project info
+project_name: trm-arthmetic-icml
+run_name: baseline_transformer_40x
+
+# Data Path
+data_paths: ['data/icml/vanilla']
+data_paths_test: ['data/icml/vanilla']
+
+# Evaluators
+evaluators:
+  - name: basicfour@BasicFourEvaluator
+
+# Dataset mode
+dataset_mode: "vanilla"
+digits: 32
+train_digits: 8
+
+# Hyperparams - Training
+global_batch_size: 256
+
+epochs: 2
+eval_interval: 1
+checkpoint_every_eval: False
+
+# Optimizer
+lr: 1e-4
+lr_min_ratio: 0.1
+lr_warmup_steps: 1000
+weight_decay: 0.05
+beta1: 0.9
+beta2: 0.95
+
+# Puzzle Embedding (None)
+puzzle_emb_lr: 0.0
+puzzle_emb_weight_decay: 0.0
+
+# Arch Override
+arch:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0

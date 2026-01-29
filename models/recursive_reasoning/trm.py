@@ -178,7 +178,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        # CLIP to avoid CUDA device-side assert if input has OOB values
+        input_clipped = torch.clamp(input.to(torch.int32), 0, self.config.vocab_size - 1)
+        embedding = self.embed_tokens(input_clipped)
 
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:

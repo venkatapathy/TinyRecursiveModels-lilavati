@@ -186,6 +186,23 @@ def main(cfg: DictConfig):
     if ckpt_path:
         config.load_checkpoint = ckpt_path
 
+    # Check for compile flag in overrides
+    compile_arg = True
+    for override in cfg.get("overrides", []):
+        if override.startswith("compile="):
+            compile_arg = override.split("=")[1].lower() == "true"
+    if "compile" in cfg:
+        compile_arg = cfg.compile
+    
+    if not compile_arg:
+        print("Disabling torch.compile via DISABLE_COMPILE environment variable.")
+        os.environ["DISABLE_COMPILE"] = "1"
+    
+    # SYSTEMIC FIX: Ensure vocab_size in config matches metadata exactly to avoid side-effects in init_train_state
+    if hasattr(config.arch, "__pydantic_extra__"):
+        config.arch.__pydantic_extra__["vocab_size"] = eval_metadata.vocab_size
+        print(f"Overriding config.arch.vocab_size to {eval_metadata.vocab_size} to match metadata.")
+
     # Initialize Model & State
     train_state = init_train_state(config, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
     

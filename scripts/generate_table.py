@@ -1,6 +1,8 @@
 import json
 import os
 import glob
+import matplotlib.pyplot as plt
+import numpy as np
 
 def load_metrics(run_name):
     # Try finding the json file in results/
@@ -20,43 +22,25 @@ def get_metric(metrics, metric_name, default="-"):
         return f"{val:.4f}"
     return default
 
-def generate_latex():
-    # Define the rows and corresponding run names / keys
-    # Map Method Name -> (ID Metrics Key Prefix, OOD Metrics Key Prefix)
-    # TRM run names usually end with _val or _test based on our new split argument
-    
-    methods = [
-        {
-            "name": "Vanilla",
-            "run_id": "basicfour_vanilla", # Base run name from config
-            "id_suffix": "val",
-            "ood_suffix": "test"
-        },
-        {
-            "name": "Concat",
-            "run_id": "basicfour_concat",
-            "id_suffix": "val", # We will match file names like basicfour_concat_val.json
-            "ood_suffix": "test"
-        },
-        {
-            "name": "Reverse",
-            "run_id": "basicfour_concat_reverse",
-            "id_suffix": "val",
-            "ood_suffix": "test"
-        },
-        {
-            "name": "Qwen 1.5B",
-            "run_id": "Qwen2.5-Math-1.5B-Instruct-Vanilla", # We used this run name for Qwen
-            "id_suffix": "val", # We need to run Qwen on Val explicitly? Or verify if we did.
-            "ood_suffix": "test" # Default was test
-        }
-        # Note: Qwen run names might be qwen_val and qwen_test if we enforce that naming in our execution script
+def get_full_methods_list():
+    return [
+        {"name": "TRM (NS)", "run_id": "basicfour_vanilla"},
+        {"name": "TRM (OS-After)", "run_id": "basicfour_concat"},
+        {"name": "TRM (OS-Before)", "run_id": "basicfour_concat_reverse"},
+        {"name": "Transformer (NS)", "run_id": "baseline_transformer_300k"},
+        {"name": "Transformer (OS-Before)", "run_id": "baseline_transformer_300k_concat_reverse"},
+        {"name": "Transformer (40x)", "run_id": "baseline_transformer_40x"},
+        {"name": "TRM (OS-Before-100d)", "run_id": "reverse_100d_run"},
+        {"name": "Qwen", "run_id": "Qwen2.5-Math-1.5B-Instruct-Vanilla"}
     ]
+
+def generate_latex():
+    methods = get_full_methods_list()
     
     # LaTeX Header
     latex = r"""\begin{table}[h]
 \centering
-\caption{Addition accuracy results comparing vanilla and Lil\={a}vati-2 supervision. Results show sequence-level accuracy (Seq) and digit-level accuracy (Digit) for both in-distribution (ID) and out-of-distribution (OOD) test sets.}
+\caption{Addition accuracy results. Results show sequence-level accuracy (Seq) and digit-level accuracy (Digit) for both in-distribution (ID) and out-of-distribution (OOD) test sets.}
 \label{tab:addition_results}
 \begin{tabular}{lccccc}
 \toprule
@@ -67,19 +51,12 @@ def generate_latex():
     for method in methods:
         name = method["name"]
         
-        # Load ID and OOD Metrics from the same file (usually _test.json)
-        # because the new evaluator splits ID/OOD internally in every run.
-        if name.startswith("Qwen"):
-             id_run = f"{method['run_id']}_val"
-             ood_run = f"{method['run_id']}_test"
-        else:
-             # Favor the test split for full table metrics
-             run_id = f"{method['run_id']}_test"
-             metrics = load_metrics(run_id)
-             # fallback to val if test not found
-             if not metrics:
-                 run_id = f"{method['run_id']}_val"
-                 metrics = load_metrics(run_id)
+        # Load Metrics
+        metrics = load_metrics(f"{method['run_id']}_test")
+        if not metrics:
+            metrics = load_metrics(method['run_id'])
+        if not metrics:
+            metrics = load_metrics(f"{method['run_id']}_val")
         
         # Extract Values
         id_seq = "-"
@@ -88,53 +65,32 @@ def generate_latex():
         ood_digit = "-"
         carry_acc = "-"
 
-        if name.startswith("Qwen"):
-            # Existing logic for Qwen if needed
-            metrics_id = load_metrics(id_run)
-            metrics_ood = load_metrics(ood_run)
-            if metrics_id:
-                for k, v in metrics_id.items():
-                    if k.endswith("accuracy") and "digit" not in k:
-                        id_seq = f"{v:.4f}"
-                        break
-            if metrics_ood:
-                for k, v in metrics_ood.items():
-                    if k.endswith("accuracy") and "digit" not in k:
-                        ood_seq = f"{v:.4f}"
-                        break
-        elif metrics:
-            # New prioritized extraction for TRM results
-            # ID Metrics
+        if metrics:
+            # Map keys based on known patterns
             id_seq = get_metric(metrics, "basicfour/id_accuracy_test", 
-                               get_metric(metrics, "basicfour/id_accuracy_val", "-"))
+                               get_metric(metrics, "basicfour/id_accuracy_val", 
+                                         get_metric(metrics, "basicfour/id_accuracy", "-")))
             id_digit = get_metric(metrics, "basicfour/id_digit_accuracy_test", 
-                                 get_metric(metrics, "basicfour/id_digit_accuracy_val", "-"))
+                                 get_metric(metrics, "basicfour/id_digit_accuracy_val", 
+                                           get_metric(metrics, "basicfour/id_digit_accuracy", "-")))
             
-            # OOD Metrics
             ood_seq = get_metric(metrics, "basicfour/ood_accuracy_test", 
-                                get_metric(metrics, "basicfour/ood_accuracy_val", "-"))
+                                get_metric(metrics, "basicfour/ood_accuracy_val", 
+                                          get_metric(metrics, "basicfour/ood_accuracy", "-")))
             ood_digit = get_metric(metrics, "basicfour/ood_digit_accuracy_test", 
-                                  get_metric(metrics, "basicfour/ood_digit_accuracy_val", "-"))
-            
-            # Fallback if granular keys not found (e.g., old results)
-            if id_seq == "-" or ood_seq == "-":
-                for k, v in metrics.items():
-                    if k.endswith("accuracy") and "digit" not in k and "carry" not in k and "id_" not in k and "ood_" not in k:
-                        # If we only have global accuracy, assign it based on file name or as global
-                        if "test" in run_id: ood_seq = f"{v:.4f}"
-                        else: id_seq = f"{v:.4f}"
-            
-            if id_digit == "-" or ood_digit == "-":
-                for k, v in metrics.items():
-                    if "digit_accuracy" in k and "id_" not in k and "ood_" not in k:
-                        if "test" in run_id: ood_digit = f"{v:.4f}"
-                        else: id_digit = f"{v:.4f}"
+                                   get_metric(metrics, "basicfour/ood_digit_accuracy_val", 
+                                             get_metric(metrics, "basicfour/ood_digit_accuracy", "-")))
+
+            # Priority 2: Vanilla keys (for Qwen/SLM)
+            if id_seq == "-": id_seq = get_metric(metrics, "vanilla/id_accuracy", "-")
+            if id_digit == "-": id_digit = get_metric(metrics, "vanilla/id_digit_accuracy", "-")
+            if ood_seq == "-": ood_seq = get_metric(metrics, "vanilla/ood_accuracy", "-")
+            if ood_digit == "-": ood_digit = get_metric(metrics, "vanilla/ood_digit_accuracy", "-")
 
             # Carry Acc
-            for k, v in metrics.items():
-                if "carry_accuracy" in k:
-                    carry_acc = f"{v:.4f}"
-                    break
+            carry_acc = get_metric(metrics, "basicfour/add_carry_accuracy_test", 
+                                  get_metric(metrics, "basicfour/add_carry_accuracy", 
+                                            get_metric(metrics, "basicfour/carry_accuracy", "-")))
         
         latex += f"{name} & {id_seq} & {id_digit} & {ood_seq} & {ood_digit} & {carry_acc} \\\\\n"
 
@@ -142,13 +98,162 @@ def generate_latex():
 \end{tabular}
 \end{table}
 """
-    print(latex)
-    
     # Save to file
     os.makedirs("results", exist_ok=True)
     with open("results/addition_results_table_generated.tex", "w") as f:
         f.write(latex)
-    print("Table saved to results/addition_results_table_generated.tex")
+    print("Addition table saved to results/addition_results_table_generated.tex")
+
+def generate_carry_table():
+    methods = get_full_methods_list()
+    
+    latex = r"""\begin{table}[h]
+\centering
+\caption{Carry/Trace Accuracy per Operation. Accuracy for intermediate carry or borrow digits predicted by models trained with structural supervision.}
+\label{tab:carry_results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Add (+)} & \textbf{Sub (-)} & \textbf{Mul (*)} & \textbf{Div (/)} \\
+\midrule
+"""
+
+    for method in methods:
+        name = method["name"]
+        
+        # Load Metrics
+        metrics = load_metrics(f"{method['run_id']}_test")
+        if not metrics:
+            metrics = load_metrics(method['run_id'])
+        if not metrics:
+            metrics = load_metrics(f"{method['run_id']}_val")
+            
+        add_carry = "-"
+        sub_carry = "-"
+        mul_carry = "-"
+        div_carry = "-"
+        
+        if metrics:
+            add_carry = get_metric(metrics, "basicfour/add_carry_accuracy_test", 
+                                  get_metric(metrics, "basicfour/add_carry_accuracy", "-"))
+            sub_carry = get_metric(metrics, "basicfour/sub_carry_accuracy_test", 
+                                  get_metric(metrics, "basicfour/sub_carry_accuracy", "-"))
+            mul_carry = get_metric(metrics, "basicfour/mul_carry_accuracy_test", 
+                                  get_metric(metrics, "basicfour/mul_carry_accuracy", "-"))
+            div_carry = get_metric(metrics, "basicfour/div_carry_accuracy_test", 
+                                  get_metric(metrics, "basicfour/div_carry_accuracy", "-"))
+            
+            # fallback for generic carry_accuracy if all per-op are missing
+            if all(v == "-" for v in [add_carry, sub_carry, mul_carry, div_carry]):
+                gen_carry = get_metric(metrics, "basicfour/carry_accuracy_test", 
+                                      get_metric(metrics, "basicfour/carry_accuracy", "-"))
+                if gen_carry != "-":
+                     add_carry = gen_carry
+
+        latex += f"{name} & {add_carry} & {sub_carry} & {mul_carry} & {div_carry} \\\\\n"
+
+    latex += r"""\bottomrule
+\end{tabular}
+\end{table}
+"""
+    with open("results/carry_accuracy_table.tex", "w") as f:
+        f.write(latex)
+    print("Carry table saved to results/carry_accuracy_table.tex")
+
+def generate_digit_wise_table():
+    methods = get_full_methods_list()
+    
+    # Key digit lengths to show in table
+    digit_lengths = [8, 12, 16, 24, 32]
+    
+    latex = r"""\begin{table}[h]
+\centering
+\caption{Exact Match Accuracy by Operand Digit Length. ID range is 1--8 digits; OOD range is 9--32 digits.}
+\label{tab:digit_wise_results}
+\begin{tabular}{l""" + "c" * len(digit_lengths) + r"""}
+\toprule
+\textbf{Method} & """ + " & ".join([f"\\textbf{{{d} Digits}}" for d in digit_lengths]) + r""" \\
+\midrule
+"""
+
+    for method in methods:
+        name = method["name"]
+        metrics = load_metrics(f"{method['run_id']}_test")
+        if not metrics:
+            metrics = load_metrics(method['run_id'])
+            
+        row_vals = []
+        for d in digit_lengths:
+            key = f"accuracy_digit_len_{d}"
+            val = "-"
+            if metrics:
+                for k, v in metrics.items():
+                    if key in k:
+                        val = f"{v:.4f}"
+                        break
+            row_vals.append(val)
+            
+        latex += f"{name} & " + " & ".join(row_vals) + " \\\\\n"
+
+    latex += r"""\bottomrule
+\end{tabular}
+\end{table}
+"""
+    with open("results/digit_wise_results_table.tex", "w") as f:
+        f.write(latex)
+    print("Digit-wise table saved to results/digit_wise_results_table.tex")
+
+def generate_digit_wise_plot():
+    methods = [
+        {"name": "TRM (NS)", "run_id": "basicfour_vanilla", "color": "red", "marker": "o"},
+        {"name": "TRM (OS-After)", "run_id": "basicfour_concat", "color": "blue", "marker": "s"},
+        {"name": "TRM (OS-Before)", "run_id": "basicfour_concat_reverse", "color": "green", "marker": "^"},
+        {"name": "Transformer (NS)", "run_id": "baseline_transformer_300k", "color": "purple", "marker": "d"},
+        {"name": "Transformer (OS-Before)", "run_id": "baseline_transformer_300k_concat_reverse", "color": "olive", "marker": "x", "linestyle": "--"},
+        {"name": "Transformer (40x)", "run_id": "baseline_transformer_40x", "color": "orange", "marker": "x"},
+        {"name": "TRM (OS-Before-100d)", "run_id": "reverse_100d_run", "color": "darkgreen", "marker": "^", "linestyle": "--"},
+    ]
+    
+    plt.figure(figsize=(12, 7))
+    
+    for method in methods:
+        metrics = load_metrics(f"{method['run_id']}_test")
+        if not metrics:
+            metrics = load_metrics(method['run_id'])
+            
+        if not metrics:
+            continue
+            
+        x = []
+        y = []
+        for d in range(1, 33):
+            key = f"accuracy_digit_len_{d}"
+            for k, v in metrics.items():
+                if key in k:
+                    x.append(d)
+                    y.append(v)
+                    break
+        
+        if x:
+            plt.plot(x, y, label=method["name"], color=method["color"], marker=method["marker"], 
+                     markersize=4, linewidth=1.5, linestyle=method.get("linestyle", "-"))
+
+    plt.axvline(x=8.5, color='gray', linestyle='--', alpha=0.5, label='ID/OOD Boundary')
+    plt.xlabel('Operand Digit Length')
+    plt.ylabel('Exact Match Accuracy')
+    plt.title('Arithmetic Performance vs. Problem Length')
+    plt.xticks(range(1, 33, 2))
+    plt.xlim(0.5, 32.5)
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', alpha=0.3)
+    plt.ylim(-0.05, 1.05)
+    
+    plot_path = "results/digit_wise_accuracy.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Digit-wise plot saved to {plot_path}")
 
 if __name__ == "__main__":
-    generate_latex()
+    generate_latex() # Original addition results
+    generate_carry_table()
+    generate_digit_wise_table()
+    generate_digit_wise_plot()

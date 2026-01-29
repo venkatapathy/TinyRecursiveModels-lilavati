@@ -124,10 +124,15 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+    arch_extras = dict(config.arch.__pydantic_extra__)  # type: ignore
+    # Remove vocab_size from arch_extras if it exists to avoid duplicate keyword argument
+    arch_extras.pop("vocab_size", None)
+    
+    vocab_size = getattr(train_metadata, "vocab_size", 23)
     model_cfg = dict(
-        **config.arch.__pydantic_extra__,  # type: ignore
+        **arch_extras,
         batch_size=config.global_batch_size // world_size,
-        vocab_size=train_metadata.vocab_size,
+        vocab_size=vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
         causal=False,  # Non-autoregressive

@@ -150,5 +150,24 @@ python3 train_slm.py \
     
 ```
 
+### Transformer
+## concat
+```bash
+python evaluate.py \
+    --config-name cfg_transformer_300k_concat_reverse \
+    project_name=trm-icml-eval \
+    +split=test \
+    +checkpoint_folder=checkpoints/trm-arthmetic-icml/baseline_transformer_300k_concat_reverse
+```
+##reverse
+```bash
+python evaluate.py \
+    --config-name cfg_transformer_300k \
+    project_name=trm-arthmetic-icml \
+    +split=test \
+    +checkpoint_folder=checkpoints/trm-arthmetic-icml/baseline_transformer_300k
+```
+
+
 # Result Compilation
 python3 scripts/generate_table.py 

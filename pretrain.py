@@ -2,9 +2,12 @@ from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os
 import math
+import random
 import yaml
 import shutil
 import copy
+
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -86,6 +89,9 @@ class PretrainConfig(pydantic.BaseModel):
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
     min_eval_interval: Optional[int] = 0 # when to start eval
+    # Split used for training-time eval. "val" is the in-distribution
+    # held-out split; "test" is the OOD split.
+    eval_split: str = "val"
     eval_save_outputs: List[str] = []
 
     ema: bool = False # use Exponential-Moving-Average
@@ -333,26 +339,18 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                     new_state_dict[new_k] = v
                     matched_keys.append(new_k)
                 else:
-                    # Size mismatch - handle manually
-                    print(f"DEBUG SIZE MISMATCH: {new_k}: ckpt {list(v.shape)} != model {list(model_state_dict[new_k].shape)}")
-                    mismatched_keys.append(new_k)
-                    with torch.no_grad():
-                        # Get the actual parameter or buffer object
-                        if new_k in model_params:
-                            target = model_params[new_k]
-                        elif new_k in model_buffers:
-                            target = model_buffers[new_k]
-                        else:
-                            continue
-                            
-                        # Copy overlapping part
-                        if target.ndim == 1:
-                            d0 = min(target.shape[0], v.shape[0])
-                            target[:d0].copy_(v[:d0])
-                        elif target.ndim == 2:
-                            d0 = min(target.shape[0], v.shape[0])
-                            d1 = min(target.shape[1], v.shape[1])
-                            target[:d0, :d1].copy_(v[:d0, :d1])
+                    # Shape mismatch used to be "handled" by copying the
+                    # overlapping corner of the tensor and continuing, which
+                    # silently produces a half-initialised model that still
+                    # evaluates and still reports numbers. A checkpoint that
+                    # does not fit the model is a bug, not a warning.
+                    raise ValueError(
+                        f"Checkpoint/model shape mismatch for {new_k!r}: "
+                        f"checkpoint {list(v.shape)} != model "
+                        f"{list(model_state_dict[new_k].shape)}. The checkpoint "
+                        f"does not belong to this architecture/vocab. Refusing "
+                        f"to partially load."
+                    )
             else:
                 skipped_keys.append(new_k)
         
@@ -756,6 +754,11 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-torch"
         if config.run_name is None:
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
+        # The seed must appear in both the run name and the checkpoint path.
+        # Without it, multi-seed runs of the same config overwrite each other's
+        # checkpoints and collide in W&B, which makes mean +/- std impossible.
+        if not config.run_name.endswith(f"_s{config.seed}"):
+            config.run_name = f"{config.run_name}_s{config.seed}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
 
@@ -792,8 +795,14 @@ def launch(hydra_config: DictConfig):
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
 
-    # Seed RNGs to ensure consistency
-    torch.random.manual_seed(config.seed + RANK)
+    # Seed every RNG, not just torch's CPU generator. Previously `random` and
+    # `numpy` were left unseeded, so data order and any numpy-driven sampling
+    # varied run to run even at a fixed `seed`.
+    seed = config.seed + RANK
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
@@ -802,10 +811,14 @@ def launch(hydra_config: DictConfig):
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
     train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    # Training-time eval runs on the VAL split, which is now genuinely
+    # in-distribution. It used to load "test", so every mid-training number
+    # was OOD and there was no in-distribution signal to train against at all.
+    # The OOD test split is scored separately by evaluate.py.
     try:
-        eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    except:
-        print("NO EVAL DATA FOUND")
+        eval_loader,  eval_metadata  = create_dataloader(config, config.eval_split, test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    except Exception as e:
+        print(f"NO EVAL DATA FOUND for split {config.eval_split!r}: {e}")
         eval_loader = eval_metadata = None
 
     try:
@@ -885,6 +898,14 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
+                # Echo the first optimizer step to stdout. Training loss
+                # otherwise exists only inside wandb, which makes the seed
+                # determinism check (scripts/check_determinism.sh) unable to
+                # compare two runs without parsing an offline run directory.
+                if train_state.step == 1:
+                    loss = metrics.get("train/lm_loss", metrics.get("train/loss"))
+                    if loss is not None:
+                        print(f"STEP0_LOSS {float(loss):.10f}", flush=True)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)

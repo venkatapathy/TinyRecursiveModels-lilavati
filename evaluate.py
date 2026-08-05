@@ -285,12 +285,18 @@ def main(cfg: DictConfig):
             wandb.log(wandb_metrics)
             wandb.finish()
             
-        # Save metrics to JSON locally for table generation
+        # Save metrics to JSON locally for table generation.
+        #
+        # Filename is structured -- {run}__seed{N}__{split}.json -- because
+        # scripts/generate_table.py parses it rather than globbing. Globbing
+        # let one run's file satisfy another run's lookup (e.g. the
+        # `basicfour_concat` pattern matching `basicfour_concat_reverse`).
         os.makedirs("results", exist_ok=True)
-        # Use run_name for filename, ensure it's safe
-        json_filename = f"{run_name}.json".replace("/", "_").replace(" ", "_")
+        base_run = (config.run_name or f"eval_{config.dataset_mode}")
+        json_filename = f"{base_run}__seed{config.seed}__{split_arg}.json"
+        json_filename = json_filename.replace("/", "_").replace(" ", "_")
         json_path = os.path.join("results", json_filename)
-        
+
         import json
         import numpy as np
 
@@ -304,17 +310,23 @@ def main(cfg: DictConfig):
                     return obj.tolist()
                 return super(NumpyEncoder, self).default(obj)
 
-        # We need to flatten the metrics if they are nested like {dataset: {metric: val}}
-        # Similar to wandb logic
-        flat_metrics = {}
+        # Flatten {set_name: {metric: value}} to plain metric names. The split
+        # and seed live in the FILENAME, not the keys -- baking them into key
+        # names is what made the table generator's exact lookups miss.
+        flat_metrics = {"_run": config.run_name, "_split": split_arg, "_seed": config.seed}
         for dataset, dataset_metrics in metrics.items():
-            prefix = f"{dataset}_{split_arg}"
             if isinstance(dataset_metrics, dict):
                 for k, v in dataset_metrics.items():
-                    flat_metrics[f"{prefix}/{k}"] = v
+                    key = k if dataset == "all" else f"{dataset}/{k}"
+                    if key in flat_metrics:
+                        raise ValueError(
+                            f"Duplicate metric key {key!r} across evaluator sets; "
+                            f"refusing to silently overwrite."
+                        )
+                    flat_metrics[key] = v
             else:
-                flat_metrics[prefix] = dataset_metrics
-                
+                flat_metrics[dataset] = dataset_metrics
+
         with open(json_path, "w") as f:
             json.dump(flat_metrics, f, indent=4, cls=NumpyEncoder)
 

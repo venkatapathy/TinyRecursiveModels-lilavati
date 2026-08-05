@@ -11,7 +11,7 @@ data_paths_test: ['data/icml/reverse']
 
 # We disable specific evaluators for now as they might expect specific metadata
 evaluators:
-  - name: basicfour@BasicFourEvaluator
+  - name: harness@ArithmeticEvaluator
 
 # Dataset mode
 dataset_mode: "basic_concat_reverse"
@@ -49,3 +49,4 @@ arch:
   carry_loss_weight: 1.0 # Not used in single head, but good to keep
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
+eval_split: val

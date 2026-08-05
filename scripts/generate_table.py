@@ -1,259 +1,234 @@
+#!/usr/bin/env python3
+"""
+Build the paper's tables and figures from the frozen harness's result files.
+
+Replaces the previous scraper, which:
+  - globbed `results/*{run_id}*.json` newest-mtime-wins, so `basicfour_concat`
+    could silently match a `basicfour_concat_reverse` file;
+  - looked up keys that `evaluate.py` never wrote (`basicfour/id_accuracy_test`
+    vs the actual `basicfour_test/basicfour/id_accuracy`) and printed "-" on a
+    miss, so Table 1 was blank-by-construction while Table 2 -- which used
+    substring matching -- resolved. That asymmetry is why the tables disagreed;
+  - reported a single value per cell with no seed aggregation;
+  - carried a hardcoded row list including `baseline_transformer_40x`, which is
+    not a run_name in any config and so could never resolve.
+
+Every lookup here is exact and every miss is an error. Cells are mean +/- std
+over seeds.
+
+Usage:
+    python3 scripts/generate_table.py [--results-dir results] [--manifest runs.json]
+"""
+
+import argparse
 import json
 import os
-import glob
-import matplotlib.pyplot as plt
+import re
+import sys
+from collections import defaultdict
+from typing import Dict, List, Optional
+
 import numpy as np
 
-def load_metrics(run_name):
-    # Try finding the json file in results/
-    pattern = f"results/*{run_name}*.json"
-    files = glob.glob(pattern)
-    if not files:
-        return None
-    
-    # Sort by time to get latest
-    files.sort(key=os.path.getmtime, reverse=True)
-    with open(files[0], 'r') as f:
-        return json.load(f)
 
-def get_metric(metrics, metric_name, default="-"):
-    if metrics and metric_name in metrics:
-        val = metrics[metric_name]
-        return f"{val:.4f}"
-    return default
+RESULT_RE = re.compile(r"^(?P<run>.+?)__seed(?P<seed>\d+)__(?P<split>val|test)\.json$")
 
-def get_full_methods_list():
-    return [
-        {"name": "TRM (NS)", "run_id": "basicfour_vanilla"},
-        {"name": "TRM (OS-After)", "run_id": "basicfour_concat"},
-        {"name": "TRM (OS-Before)", "run_id": "basicfour_concat_reverse"},
-        {"name": "Transformer (NS)", "run_id": "baseline_transformer_300k"},
-        {"name": "Transformer (OS-Before)", "run_id": "baseline_transformer_300k_concat_reverse"},
-        {"name": "Transformer (40x)", "run_id": "baseline_transformer_40x"},
-        {"name": "TRM (OS-Before-100d)", "run_id": "reverse_100d_run"},
-        {"name": "Qwen", "run_id": "Qwen2.5-Math-1.5B-Instruct-Vanilla"}
-    ]
+# pretrain.py appends `_s{seed}` to run_name so checkpoint dirs never collide
+# across seeds. The seed is already captured from the filename, so strip that
+# suffix to recover the bare run identity -- otherwise trm_ns_s1 and trm_ns_s2
+# land in separate groups and nothing ever aggregates.
+SEED_SUFFIX_RE = re.compile(r"_s\d+$")
 
-def generate_latex():
-    methods = get_full_methods_list()
-    
-    # LaTeX Header
-    latex = r"""\begin{table}[h]
-\centering
-\caption{Addition accuracy results. Results show sequence-level accuracy (Seq) and digit-level accuracy (Digit) for both in-distribution (ID) and out-of-distribution (OOD) test sets.}
-\label{tab:addition_results}
-\begin{tabular}{lccccc}
-\toprule
-\textbf{Method} & \textbf{ID Seq} & \textbf{ID Digit} & \textbf{OOD Seq} & \textbf{OOD Digit} & \textbf{Carry Acc} \\
-\midrule
-"""
 
-    for method in methods:
-        name = method["name"]
-        
-        # Load Metrics
-        metrics = load_metrics(f"{method['run_id']}_test")
-        if not metrics:
-            metrics = load_metrics(method['run_id'])
-        if not metrics:
-            metrics = load_metrics(f"{method['run_id']}_val")
-        
-        # Extract Values
-        id_seq = "-"
-        id_digit = "-"
-        ood_seq = "-"
-        ood_digit = "-"
-        carry_acc = "-"
+class MissingMetric(KeyError):
+    pass
 
-        if metrics:
-            # Map keys based on known patterns
-            id_seq = get_metric(metrics, "basicfour/id_accuracy_test", 
-                               get_metric(metrics, "basicfour/id_accuracy_val", 
-                                         get_metric(metrics, "basicfour/id_accuracy", "-")))
-            id_digit = get_metric(metrics, "basicfour/id_digit_accuracy_test", 
-                                 get_metric(metrics, "basicfour/id_digit_accuracy_val", 
-                                           get_metric(metrics, "basicfour/id_digit_accuracy", "-")))
-            
-            ood_seq = get_metric(metrics, "basicfour/ood_accuracy_test", 
-                                get_metric(metrics, "basicfour/ood_accuracy_val", 
-                                          get_metric(metrics, "basicfour/ood_accuracy", "-")))
-            ood_digit = get_metric(metrics, "basicfour/ood_digit_accuracy_test", 
-                                   get_metric(metrics, "basicfour/ood_digit_accuracy_val", 
-                                             get_metric(metrics, "basicfour/ood_digit_accuracy", "-")))
 
-            # Priority 2: Vanilla keys (for Qwen/SLM)
-            if id_seq == "-": id_seq = get_metric(metrics, "vanilla/id_accuracy", "-")
-            if id_digit == "-": id_digit = get_metric(metrics, "vanilla/id_digit_accuracy", "-")
-            if ood_seq == "-": ood_seq = get_metric(metrics, "vanilla/ood_accuracy", "-")
-            if ood_digit == "-": ood_digit = get_metric(metrics, "vanilla/ood_digit_accuracy", "-")
+def load_results(results_dir: str) -> Dict[str, Dict[str, List[dict]]]:
+    """
+    Load every result file into {run_name: {split: [payload, ...]}}.
 
-            # Carry Acc
-            carry_acc = get_metric(metrics, "basicfour/add_carry_accuracy_test", 
-                                  get_metric(metrics, "basicfour/add_carry_accuracy", 
-                                            get_metric(metrics, "basicfour/carry_accuracy", "-")))
-        
-        latex += f"{name} & {id_seq} & {id_digit} & {ood_seq} & {ood_digit} & {carry_acc} \\\\\n"
+    Filenames are `{run}__seed{N}__{split}.json` -- structured, not globbed,
+    so a run can never absorb another run's file.
+    """
+    if not os.path.isdir(results_dir):
+        raise SystemExit(f"No results directory at {results_dir!r}. Run evaluate.py first.")
 
-    latex += r"""\bottomrule
-\end{tabular}
-\end{table}
-"""
-    # Save to file
-    os.makedirs("results", exist_ok=True)
-    with open("results/addition_results_table_generated.tex", "w") as f:
-        f.write(latex)
-    print("Addition table saved to results/addition_results_table_generated.tex")
-
-def generate_carry_table():
-    methods = get_full_methods_list()
-    
-    latex = r"""\begin{table}[h]
-\centering
-\caption{Carry/Trace Accuracy per Operation. Accuracy for intermediate carry or borrow digits predicted by models trained with structural supervision.}
-\label{tab:carry_results}
-\begin{tabular}{lcccc}
-\toprule
-\textbf{Method} & \textbf{Add (+)} & \textbf{Sub (-)} & \textbf{Mul (*)} & \textbf{Div (/)} \\
-\midrule
-"""
-
-    for method in methods:
-        name = method["name"]
-        
-        # Load Metrics
-        metrics = load_metrics(f"{method['run_id']}_test")
-        if not metrics:
-            metrics = load_metrics(method['run_id'])
-        if not metrics:
-            metrics = load_metrics(f"{method['run_id']}_val")
-            
-        add_carry = "-"
-        sub_carry = "-"
-        mul_carry = "-"
-        div_carry = "-"
-        
-        if metrics:
-            add_carry = get_metric(metrics, "basicfour/add_carry_accuracy_test", 
-                                  get_metric(metrics, "basicfour/add_carry_accuracy", "-"))
-            sub_carry = get_metric(metrics, "basicfour/sub_carry_accuracy_test", 
-                                  get_metric(metrics, "basicfour/sub_carry_accuracy", "-"))
-            mul_carry = get_metric(metrics, "basicfour/mul_carry_accuracy_test", 
-                                  get_metric(metrics, "basicfour/mul_carry_accuracy", "-"))
-            div_carry = get_metric(metrics, "basicfour/div_carry_accuracy_test", 
-                                  get_metric(metrics, "basicfour/div_carry_accuracy", "-"))
-            
-            # fallback for generic carry_accuracy if all per-op are missing
-            if all(v == "-" for v in [add_carry, sub_carry, mul_carry, div_carry]):
-                gen_carry = get_metric(metrics, "basicfour/carry_accuracy_test", 
-                                      get_metric(metrics, "basicfour/carry_accuracy", "-"))
-                if gen_carry != "-":
-                     add_carry = gen_carry
-
-        latex += f"{name} & {add_carry} & {sub_carry} & {mul_carry} & {div_carry} \\\\\n"
-
-    latex += r"""\bottomrule
-\end{tabular}
-\end{table}
-"""
-    with open("results/carry_accuracy_table.tex", "w") as f:
-        f.write(latex)
-    print("Carry table saved to results/carry_accuracy_table.tex")
-
-def generate_digit_wise_table():
-    methods = get_full_methods_list()
-    
-    # Key digit lengths to show in table
-    digit_lengths = [8, 12, 16, 24, 32]
-    
-    latex = r"""\begin{table}[h]
-\centering
-\caption{Exact Match Accuracy by Operand Digit Length. ID range is 1--8 digits; OOD range is 9--32 digits.}
-\label{tab:digit_wise_results}
-\begin{tabular}{l""" + "c" * len(digit_lengths) + r"""}
-\toprule
-\textbf{Method} & """ + " & ".join([f"\\textbf{{{d} Digits}}" for d in digit_lengths]) + r""" \\
-\midrule
-"""
-
-    for method in methods:
-        name = method["name"]
-        metrics = load_metrics(f"{method['run_id']}_test")
-        if not metrics:
-            metrics = load_metrics(method['run_id'])
-            
-        row_vals = []
-        for d in digit_lengths:
-            key = f"accuracy_digit_len_{d}"
-            val = "-"
-            if metrics:
-                for k, v in metrics.items():
-                    if key in k:
-                        val = f"{v:.4f}"
-                        break
-            row_vals.append(val)
-            
-        latex += f"{name} & " + " & ".join(row_vals) + " \\\\\n"
-
-    latex += r"""\bottomrule
-\end{tabular}
-\end{table}
-"""
-    with open("results/digit_wise_results_table.tex", "w") as f:
-        f.write(latex)
-    print("Digit-wise table saved to results/digit_wise_results_table.tex")
-
-def generate_digit_wise_plot():
-    methods = [
-        {"name": "TRM (NS)", "run_id": "basicfour_vanilla", "color": "red", "marker": "o"},
-        {"name": "TRM (OS-After)", "run_id": "basicfour_concat", "color": "blue", "marker": "s"},
-        {"name": "TRM (OS-Before)", "run_id": "basicfour_concat_reverse", "color": "green", "marker": "^"},
-        {"name": "Transformer (NS)", "run_id": "baseline_transformer_300k", "color": "purple", "marker": "d"},
-        {"name": "Transformer (OS-Before)", "run_id": "baseline_transformer_300k_concat_reverse", "color": "olive", "marker": "x", "linestyle": "--"},
-        {"name": "Transformer (40x)", "run_id": "baseline_transformer_40x", "color": "orange", "marker": "x"},
-        {"name": "TRM (OS-Before-100d)", "run_id": "reverse_100d_run", "color": "darkgreen", "marker": "^", "linestyle": "--"},
-    ]
-    
-    plt.figure(figsize=(12, 7))
-    
-    for method in methods:
-        metrics = load_metrics(f"{method['run_id']}_test")
-        if not metrics:
-            metrics = load_metrics(method['run_id'])
-            
-        if not metrics:
+    out: Dict[str, Dict[str, List[dict]]] = defaultdict(lambda: defaultdict(list))
+    n = 0
+    for fn in sorted(os.listdir(results_dir)):
+        m = RESULT_RE.match(fn)
+        if not m:
+            # runs.json is the manifest and leakage_control.json is a Stage 0
+            # control artifact -- both live here legitimately and are not runs.
+            if fn.endswith(".json") and fn not in ("runs.json", "leakage_control.json"):
+                print(f"  ! ignoring unrecognised result file: {fn}", file=sys.stderr)
             continue
-            
-        x = []
-        y = []
-        for d in range(1, 33):
-            key = f"accuracy_digit_len_{d}"
-            for k, v in metrics.items():
-                if key in k:
-                    x.append(d)
-                    y.append(v)
-                    break
-        
-        if x:
-            plt.plot(x, y, label=method["name"], color=method["color"], marker=method["marker"], 
-                     markersize=4, linewidth=1.5, linestyle=method.get("linestyle", "-"))
+        with open(os.path.join(results_dir, fn)) as f:
+            payload = json.load(f)
+        seed = int(m.group("seed"))
+        run = SEED_SUFFIX_RE.sub("", m.group("run"))
+        payload["_seed"] = seed
+        if any(p["_seed"] == seed for p in out[run][m.group("split")]):
+            raise SystemExit(
+                f"Duplicate result for run {run!r} seed {seed} split "
+                f"{m.group('split')!r} (file {fn}). Two files claim the same "
+                f"cell; refusing to average them."
+            )
+        out[run][m.group("split")].append(payload)
+        n += 1
+    print(f"Loaded {n} result files for {len(out)} runs from {results_dir}/")
+    return out
 
-    plt.axvline(x=8.5, color='gray', linestyle='--', alpha=0.5, label='ID/OOD Boundary')
-    plt.xlabel('Operand Digit Length')
-    plt.ylabel('Exact Match Accuracy')
-    plt.title('Arithmetic Performance vs. Problem Length')
-    plt.xticks(range(1, 33, 2))
-    plt.xlim(0.5, 32.5)
-    plt.legend()
-    plt.grid(True, which='both', linestyle='--', alpha=0.3)
-    plt.ylim(-0.05, 1.05)
-    
-    plot_path = "results/digit_wise_accuracy.png"
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Digit-wise plot saved to {plot_path}")
+
+def agg(runs: Dict[str, Dict[str, List[dict]]], run: str, split: str, key: str) -> tuple:
+    """Return (mean, std, n_seeds) for `key`, or raise if anything is missing."""
+    if run not in runs:
+        raise MissingMetric(f"no results for run {run!r}")
+    if split not in runs[run]:
+        raise MissingMetric(f"run {run!r} has no {split!r} split")
+    vals = []
+    for payload in runs[run][split]:
+        if key not in payload:
+            raise MissingMetric(
+                f"run {run!r} seed {payload['_seed']} split {split!r} "
+                f"is missing metric {key!r}. Available: {sorted(payload)[:8]}..."
+            )
+        vals.append(float(payload[key]))
+    return float(np.mean(vals)), float(np.std(vals)), len(vals)
+
+
+def fmt(mean: float, std: float, n: int) -> str:
+    if n == 1:
+        return f"{mean:.3f}"
+    return f"{mean:.3f} $\\pm$ {std:.3f}"
+
+
+def cell(runs, run, split, key, strict: bool) -> str:
+    try:
+        return fmt(*agg(runs, run, split, key))
+    except MissingMetric as e:
+        if strict:
+            raise SystemExit(f"ERROR: {e}")
+        print(f"  ! {e}", file=sys.stderr)
+        return r"\textemdash"
+
+
+def load_manifest(path: Optional[str]) -> List[dict]:
+    """
+    Row list comes from a manifest so new runs/seeds/sizes never require
+    editing this file.  Each entry: {"name": ..., "run": ...}.
+    """
+    if path and os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)["rows"]
+    raise SystemExit(
+        f"No manifest at {path!r}. Write one listing the runs to tabulate, e.g.\n"
+        '  {"rows": [{"name": "TRM (OS-Before)", "run": "trm_os_before"}]}'
+    )
+
+
+def main_table(runs, rows, strict) -> str:
+    cols = [
+        ("ID Seq", "val", "seq_accuracy"),
+        ("ID Digit", "val", "digit_accuracy"),
+        ("OOD Seq", "test", "ood_seq_accuracy"),
+        ("OOD Digit", "test", "ood_digit_accuracy"),
+        ("Trace", "test", "trace_accuracy"),
+    ]
+    head = " & ".join(f"\\textbf{{{c[0]}}}" for c in cols)
+    out = [
+        r"\begin{table}[h]", r"\centering",
+        r"\caption{Arithmetic accuracy. ID = 1--8 max operand digits (held-out "
+        r"in-distribution split); OOD = 9--32. Mean $\pm$ std over seeds. "
+        r"All numbers from the frozen harness (\texttt{evaluators/harness.py}).}",
+        r"\label{tab:main}",
+        r"\begin{tabular}{l" + "c" * len(cols) + "}", r"\toprule",
+        r"\textbf{Method} & " + head + r" \\", r"\midrule",
+    ]
+    for r in rows:
+        vals = [cell(runs, r["run"], sp, k, strict) for _, sp, k in cols]
+        out.append(f"{r['name']} & " + " & ".join(vals) + r" \\")
+    out += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    return "\n".join(out) + "\n"
+
+
+def length_table(runs, rows, strict, lengths=(8, 12, 16, 24, 32)) -> str:
+    out = [
+        r"\begin{table}[h]", r"\centering",
+        r"\caption{Exact-match accuracy by max operand digit length.}",
+        r"\label{tab:by_length}",
+        r"\begin{tabular}{l" + "c" * len(lengths) + "}", r"\toprule",
+        r"\textbf{Method} & " + " & ".join(f"\\textbf{{{d}}}" for d in lengths) + r" \\",
+        r"\midrule",
+    ]
+    for r in rows:
+        vals = [cell(runs, r["run"], "test", f"len_{d}_seq_accuracy", strict) for d in lengths]
+        out.append(f"{r['name']} & " + " & ".join(vals) + r" \\")
+    out += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    return "\n".join(out) + "\n"
+
+
+def length_plot(runs, rows, out_path, max_len=32):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 5.2))
+    for r in rows:
+        xs, ys, es = [], [], []
+        for d in range(1, max_len + 1):
+            try:
+                m, s, _ = agg(runs, r["run"], "test", f"len_{d}_seq_accuracy")
+            except MissingMetric:
+                continue
+            xs.append(d); ys.append(m); es.append(s)
+        if not xs:
+            continue
+        ys, es = np.array(ys), np.array(es)
+        line, = ax.plot(xs, ys, marker="o", markersize=3, linewidth=1.6, label=r["name"])
+        ax.fill_between(xs, ys - es, ys + es, alpha=0.18, color=line.get_color())
+
+    ax.axvline(8.5, color="0.4", linestyle="--", linewidth=1)
+    ax.annotate("train range ends", xy=(8.5, 1.02), xytext=(8.8, 1.02),
+                fontsize=9, color="0.35", va="center")
+    ax.set_xlabel("Max operand digit length")
+    ax.set_ylabel("Exact-match accuracy")
+    ax.set_ylim(-0.03, 1.08)
+    ax.set_xlim(0.5, max_len + 0.5)
+    ax.grid(alpha=0.25, linestyle="--")
+    ax.legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    print(f"  wrote {out_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results-dir", default="results")
+    ap.add_argument("--manifest", default="results/runs.json")
+    ap.add_argument("--out-dir", default="results")
+    ap.add_argument("--lenient", action="store_true",
+                    help="Emit an em-dash for missing metrics instead of failing. "
+                         "Never use this for numbers that go in the paper.")
+    args = ap.parse_args()
+
+    runs = load_results(args.results_dir)
+    rows = load_manifest(args.manifest)
+    strict = not args.lenient
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    for fname, content in [
+        ("main_table.tex", main_table(runs, rows, strict)),
+        ("length_table.tex", length_table(runs, rows, strict)),
+    ]:
+        p = os.path.join(args.out_dir, fname)
+        with open(p, "w") as f:
+            f.write(content)
+        print(f"  wrote {p}")
+
+    length_plot(runs, rows, os.path.join(args.out_dir, "accuracy_by_length.png"))
+
 
 if __name__ == "__main__":
-    generate_latex() # Original addition results
-    generate_carry_table()
-    generate_digit_wise_table()
-    generate_digit_wise_plot()
+    main()

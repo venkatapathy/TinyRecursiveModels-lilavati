@@ -17,7 +17,7 @@ data_paths_test: ['data/icml/vanilla']
 
 # Evaluators
 evaluators:
-  - name: basicfour@BasicFourEvaluator
+  - name: harness@ArithmeticEvaluator
 
 # Dataset mode
 dataset_mode: "vanilla"
@@ -47,3 +47,6 @@ puzzle_emb_weight_decay: 0.0
 arch:
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
+seed: 42
+max_len: 512
+eval_split: val

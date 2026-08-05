@@ -10,7 +10,7 @@ data_paths: ['data/reverse_100d']
 data_paths_test: ['data/reverse_100d']
 
 evaluators:
-  - name: basicfour@BasicFourEvaluator
+  - name: harness@ArithmeticEvaluator
 
 # Dataset mode
 dataset_mode: "basic_concat_reverse"
@@ -48,3 +48,4 @@ arch:
   carry_loss_weight: 1.0
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
+eval_split: val

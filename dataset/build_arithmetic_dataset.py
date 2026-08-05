@@ -49,10 +49,22 @@ VOCAB_MAP = {
     '5': 7, '6': 8, '7': 9, '8': 10, '9': 11,
     '+': 12, '-': 13, '*': 14, '/': 15, '=': 16,
     'R': 17,
-    '<RES>': 22
+    '<RES>': 22,
+    '<SEP>': 23,
 }
 PAD_ID = 0
+MASK_ID = 1
 IGNORE_LABEL_ID = -100
+
+# How many PAD positions after the target are supervised as an explicit
+# end-of-answer terminator. Kept small on purpose -- see the label
+# construction in build_dataset() for why supervising the whole field fails.
+N_TERMINATOR_PADS = 1
+
+# Vocab size once the state/answer tokens are in play (ids 0..23).
+VOCAB_SIZE_STATE = 24
+# Vocab size for the plain no-scratchpad format (ids 0..17).
+VOCAB_SIZE_PLAIN = 18
 
 def encode_str(s: str) -> List[int]:
     return [VOCAB_MAP[c] for c in s]
@@ -330,17 +342,26 @@ def generate_division(q: int, d: int) -> Dict:
 # -----------------------------------------------------------------------------
 
 class Sampler:
-    def __init__(self, 
-                 op: str, 
+    def __init__(self,
+                 op: str,
                  train_max_res_digits: int,
-                 test_max_res_digits: int, 
+                 test_max_res_digits: int,
                  allow_zero: bool = False,
-                 seed: int = 42):
+                 seed: int = 42,
+                 max_divisor_digits: int = 3):
         self.op = op
         self.train_limit = train_max_res_digits
         self.test_limit = test_max_res_digits
         self.allow_zero = allow_zero
         self.rng = random.Random(seed)
+        # Long-division remainders are bounded by the divisor, so an
+        # unbounded divisor makes the remainder trace O(L * len(d)) tokens --
+        # quadratic in the problem length, and worse, it makes the per-step
+        # state size grow with the input. That destroys the position
+        # invariance that the whole length-generalization argument rests on.
+        # Bounding the divisor keeps each step's state constant-width, which
+        # is the standard long-division setting.
+        self.max_divisor_digits = max_divisor_digits
         
     def _sample_operand(self, max_digits: int) -> int:
         """Sample number with random length up to max_digits."""
@@ -360,109 +381,97 @@ class Sampler:
 
     def generate_pair(self, is_train: bool) -> Tuple:
         """
-        Generate (a, b) such that result length falls in desired bucket.
-        Strategy:
-        1. Pick target result length L within range.
-        2. Heuristically sample operands to unlikely hit that length.
-        3. Verify and retry.
+        Sample (a, b) bucketed by MAX OPERAND DIGIT LENGTH.
+
+        This is the single ID/OOD definition used everywhere -- the sampler,
+        the eval harness, and the SLM/Qwen path. It replaces the previous
+        scheme, which targeted *result* length here while the evaluator
+        thresholded on *operand* length, so the ID/OOD boundary in the tables
+        never matched the boundary the data was built around.
+
+        `is_train=True` draws the in-distribution range [1, train_limit];
+        otherwise the strictly out-of-distribution range
+        [train_limit+1, test_limit]. Both the train AND val splits must be
+        generated with is_train=True -- a val split drawn from the OOD range
+        is not a validation set.
+
+        Sampling is exact rather than rejection-based: one operand gets
+        exactly L digits and the other gets 1..L, so the realised length
+        histogram matches the requested one by construction and there is no
+        silent fallback.
         """
-        limit = self.train_limit if is_train else self.test_limit
-        min_limit = 1
-        if not is_train:
-            # For OOD test, we prefer lengths > train_limit
-            min_limit = self.train_limit + 1 if self.train_limit < self.test_limit else 1
-            
-        target_res_len = self.rng.randint(min_limit, limit)
-        
-        # Heuristics to get target length
-        for _ in range(50): # attempts
-            if self.op == "+":
-                # len(a+b) ~ max(len a, len b) or +1
-                # Sample len_a close to target_res_len
-                len_a = self.rng.randint(1, target_res_len)
-                len_b = self.rng.randint(1, target_res_len)
-                # Bias towards at least one being target_res_len or target_res_len-1
-                if self.rng.random() < 0.5:
-                     len_a = target_res_len
-                else:
-                     len_a = max(1, target_res_len - 1)
-                
-                a = self._sample_operand(len_a) # _sample_operand samples UP TO, wait fix
-                # We want EXACT length sampling helper?
-                # _sample_operand(L) implementation above samples length uniformly. 
-                # Let's fix that: specific length sampling.
-                a = self._sample_n_digits(len_a)
-                b = self._sample_n_digits(len_b)
-                
-                res_len = len(str(a + b))
-                
-            elif self.op == "-":
-                # len(a-b). A >= B.
-                # A ~ target. B can be anything smaller.
-                len_a = target_res_len
-                if self.rng.random() < 0.3: # sometimes larger A can reduce to target len
-                    len_a = target_res_len + self.rng.randint(0, 2)
-                
-                a = self._sample_n_digits(len_a)
-                b_max = a if not self.allow_zero else a
-                b = self.rng.randint(1 if not self.allow_zero else 0, max(1, a)) # a >= b
-                
-                # Resample b to have varying lengths
-                len_b = self.rng.randint(1, len_a)
-                b = self._sample_n_digits(len_b)
-                while b > a: b //= 10 # ensure b <= a roughly
-                # Or just reroll
-                if b > a: b = self.rng.randint(1, a)
-                
-                res_len = len(str(a - b))
-                
-            elif self.op == "*":
-                # len(a*b) ~ len(a) + len(b)
-                # Split target len into l_a + l_b = target
-                if target_res_len == 1:
-                    l_a, l_b = 1, 1
-                else:
-                    l_a = self.rng.randint(1, target_res_len - 1)
-                    l_b = target_res_len - l_a
-                    # Adjust to allow loose bounds (+-1)
-                
-                a = self._sample_n_digits(l_a)
-                # Cap trailing zeros for mul
-                if self.rng.random() < 0.8: # 80% remove trailing zeros from operands
-                    while a > 0 and a % 10 == 0: a //= 10
-                    if a == 0: a = 1
-                
-                b = self._sample_n_digits(min(l_b, limit)) # bound b
-                while b > 0 and b % 10 == 0: b //= 10
-                if b == 0: b = 1
-                
-                res_len = len(str(a * b))
-                
-            elif self.op == "/":
-                # A / D = Q.
-                # Target result length is len(Q).
-                len_q = target_res_len
-                q = self._sample_n_digits(len_q)
-                
-                # Divisor D. Can be anything.
-                # But A = Q*D must vary.
-                len_d = self.rng.randint(1, 8) # Limit divisor size somewhat? or up to limit?
-                d = self._sample_n_digits(len_d)
-                
-                # Check constraints?
-                # If we want A (dividend) to be within some global max?
-                # User didn't specify global operand max, just RESULT-based bucketing.
-                # For Div, input A is the structural "operand" but Q is the result.
-                # So bucket by Q length.
-                res_len = len(str(q))
-                return q, d # For div we need Q, D to make A
-                
-            if res_len == target_res_len:
-                return a, b
-            
-        # Fallback
+        if is_train:
+            lo, hi = 1, self.train_limit
+        else:
+            lo = self.train_limit + 1 if self.train_limit < self.test_limit else 1
+            hi = self.test_limit
+        if lo > hi:
+            raise ValueError(
+                f"Empty length range [{lo}, {hi}] for op {self.op} "
+                f"(train_limit={self.train_limit}, test_limit={self.test_limit})"
+            )
+
+        target_len = self.rng.randint(lo, hi)
+
+        if self.op == "/":
+            # Prompt operands are the dividend A and the divisor D, and
+            # A = q*d >= d, so max operand length == len(A). Pick d first,
+            # then pick q so that len(q*d) is exactly target_len. Division
+            # previously returned before the length check entirely, leaving
+            # dividend length uncontrolled.
+            len_d = self.rng.randint(1, min(target_len, self.max_divisor_digits))
+            d = self._sample_n_digits(len_d)
+            if d == 0:
+                d = 1
+
+            lo_a = 10 ** (target_len - 1)
+            hi_a = 10 ** target_len - 1
+            lo_q = -(-lo_a // d)          # ceil(lo_a / d)
+            hi_q = hi_a // d              # floor(hi_a / d)
+            if lo_q > hi_q:
+                # Only possible if d has more digits than target_len, which
+                # the len_d draw above excludes.
+                lo_q = hi_q = max(1, lo_q)
+            q = self.rng.randint(max(1, lo_q), max(1, hi_q))
+            return q, d
+
+        # One operand has exactly target_len digits; the other is 1..target_len.
+        other_len = self.rng.randint(1, target_len)
+        if self.rng.random() < 0.5:
+            len_a, len_b = target_len, other_len
+        else:
+            len_a, len_b = other_len, target_len
+
+        a = self._sample_n_digits(len_a)
+        b = self._sample_n_digits(len_b)
+
+        if self.op == "-":
+            # Results are kept non-negative; swapping preserves both lengths.
+            if a < b:
+                a, b = b, a
+
+        if self.op == "*":
+            # Trailing zeros make multiplication trivially easy, so strip them
+            # most of the time -- but re-pad to preserve the digit length that
+            # this example is bucketed under.
+            if self.rng.random() < 0.8:
+                a = self._strip_trailing_zeros(a, len_a)
+                b = self._strip_trailing_zeros(b, len_b)
+
         return a, b
-    
+
+    def _strip_trailing_zeros(self, n: int, n_digits: int) -> int:
+        """Remove trailing zeros while keeping the digit count at n_digits."""
+        if n % 10 != 0:
+            return n
+        s = str(n).rstrip("0")
+        if not s:
+            s = "1"
+        # Re-pad with non-zero digits so the length bucket is preserved.
+        while len(s) < n_digits:
+            s += str(self.rng.randint(1, 9))
+        return int(s)
+
     def _sample_n_digits(self, n: int) -> int:
         if n <= 0: return 0
         if n == 1:
@@ -500,10 +509,7 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
         
         # Result: "Y"
         result_ids = encode_str(Y)
-        
-        # Full Input: Prompt + Result
-        input_ids = prompt_ids + result_ids
-        
+
         # BASICFOUR CONCAT LOGIC
         concat_suffix_ids = []
         if dataset_mode in ["basicfour_concat", "basic_concat_reverse"]:
@@ -534,42 +540,25 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
                 # Let's concatenate remainders for division as they are the "state".
                 inter_val_list = item["labels"].get("div_remainders", [])
             
-            # Map integers to vocab IDs
-            # Simple digits 0-9 -> VOCAB_MAP[str(d)]
-            # If value > 9 (like carry 12), we treat it as multi-digit? 
-            # Or is carry always single digit? 
-            # Addition carry <= 1. Sub borrow <= 1. 
-            # Mul carry cols can be large! e.g. 9*9 + 8 = 89 -> carry 8.
-            # Sum of products can be larger. 
-            # If carry > 9, we need multi-token representation or special tokens.
-            # For now, let's assume we output digits of the carry value if > 9.
-            # But "Lilavati" usually assumes single digit? 
-            # Wait, `trm.py` usually predicts a single token. 
-            # If carry > 9 (possible in Mul), we might need to separate it. 
-            # Let's stringify each value and encode.
-            
-            suffix_str_parts = []
-            for val in inter_val_list:
-                suffix_str_parts.append(str(val)) # e.g. "1", "0", "12"
-            
-            # Join with what? Just sequence? 
-            # Usually: <CAR> c1 c2 c3 ...
-            # If c_i is "12", it becomes "1" "2". 
-            # BUT we lose boundary. 
-            # Ideally Mul carries are single "values" but if they exceed 9, we need boundaries or multi-token.
-            # Let's treat them as sequence of digits.
-            
+            # Map state values to vocab ids.
+            #
+            # Addition carries and subtraction borrows are always 0/1, but
+            # multiplication column carries and division remainders are
+            # unbounded (e.g. 9*9 + 8 -> 89). Writing those as bare digits
+            # loses the value boundary, which makes the trace positionally
+            # ambiguous at exactly the OOD lengths we care about. Every value
+            # is therefore terminated by <SEP>, so the trace is
+            #   <CAR_op> v0 <SEP> v1 <SEP> ... v_{n-1} <SEP>
+            # and value k is always recoverable regardless of magnitude.
+            sep_id = vocab_map['<SEP>']
             suffix_seq_ids = [car_token_id]
             for val in inter_val_list:
-                s_val = str(val)
-                for char in s_val:
+                for char in str(val):
                     suffix_seq_ids.append(VOCAB_MAP[char])
-            
+                suffix_seq_ids.append(sep_id)
+
             concat_suffix_ids = suffix_seq_ids
-            
-            # Append to inputs
-            input_ids = input_ids + concat_suffix_ids
-        
+
         # Aux Labels: IGNORE on Prompt, Carry ids on Result
         inter_list = []
         if dataset_mode not in ["basicfour_concat", "basic_concat_reverse"]:
@@ -591,47 +580,70 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
                     safe_list.append(x)
             inter_list = safe_list
             
-        if len(inter_list) == 0:
-             aux_labels = [IGNORE_LABEL_ID] * len(input_ids)
-        else:
-             target_len = len(result_ids)
-             if len(inter_list) >= target_len:
-                 aligned_inter = inter_list[-target_len:]
-             else:
-                 diff = target_len - len(inter_list)
-                 aligned_inter = [0]*diff + inter_list
-            
-             aux_labels = [IGNORE_LABEL_ID] * len(prompt_ids) + aligned_inter
-        
-        # CAUSAL LM SHIFTING
-        full_ids = prompt_ids + result_ids + concat_suffix_ids
+        # ------------------------------------------------------------------
+        # MASKED OUTPUT FIELD
+        #
+        # The model is bidirectional (causal=False in both TRM and the
+        # Transformer baseline). Feeding it the answer and asking it to
+        # predict a one-position shift of its own input lets position t
+        # attend to position t+1 and copy the very token it is scored on.
+        # Instead the prompt is followed by a FIXED-WIDTH field of MASK
+        # tokens, and the targets live in the label array only.
+        #
+        # The field width deliberately does NOT depend on the answer length:
+        # sizing it to len(result) would leak the answer's magnitude. Every
+        # example gets the same field, and the model must learn where its
+        # own output stops by predicting PAD.
+        # ------------------------------------------------------------------
+        target_ids = result_ids + concat_suffix_ids
         if dataset_mode == "basic_concat_reverse":
-            full_ids = prompt_ids + concat_suffix_ids + [res_token_id] + result_ids
-        
-        # Update input_ids to match the reordered full_ids
-        input_ids = full_ids
-        
-        # Resync aux_labels length (since we might have added RES token)
-        if len(aux_labels) != len(input_ids):
-             # For basicfour modes, aux_labels are all IGNORE anyway
-             aux_labels = [IGNORE_LABEL_ID] * len(input_ids)
-        
-        shifted_lm_labels = full_ids[1:] + [PAD_ID]
-        
-        # Masking Prompt (Keep only the '=' prediction which is Result[0])
-        # Indices 0 to len(prompt_ids)-2 should be IGNORED.
-        # index len(prompt_ids)-1 is '=', predicting Result[0].
-        for i in range(len(prompt_ids) - 1):
-            shifted_lm_labels[i] = IGNORE_LABEL_ID
-            
-        lm_labels = shifted_lm_labels
-        
-        # Shift Aux Labels
-        shifted_aux_labels = aux_labels[1:] + [PAD_ID]
-        aux_labels = shifted_aux_labels
-        
-        assert len(input_ids) == len(lm_labels) == len(aux_labels)
-        
+            target_ids = concat_suffix_ids + [res_token_id] + result_ids
+
+        field_width = max_len - len(prompt_ids)
+        if field_width < len(target_ids) + N_TERMINATOR_PADS:
+            raise ValueError(
+                f"Example exceeds max_len: prompt={len(prompt_ids)} + "
+                f"target={len(target_ids)} + terminator={N_TERMINATOR_PADS} "
+                f"> max_len={max_len} (op={op}, A={A}, B={B}). Increase "
+                f"--max_len; truncating here would silently corrupt the OOD "
+                f"examples."
+            )
+
+        input_ids = prompt_ids + [MASK_ID] * field_width
+
+        # Labels are position-aligned with inputs (no shift): the prompt span
+        # is ignored and the target occupies the head of the field.
+        #
+        # Termination is taught by supervising exactly N_TERMINATOR_PADS PAD
+        # positions immediately after the target -- NOT by supervising PAD
+        # across the whole remaining field. The field is ~500 wide while a
+        # target is ~5-20 tokens, so supervising every trailing slot puts
+        # 96-99% of the cross-entropy mass on "emit PAD" and starves the
+        # arithmetic signal by two orders of magnitude. Everything past the
+        # terminator is IGNORE_LABEL_ID; decoding stops at the first PAD, so
+        # those positions are unobservable anyway.
+        n_trailing = field_width - len(target_ids) - N_TERMINATOR_PADS
+        lm_labels = (
+            [IGNORE_LABEL_ID] * len(prompt_ids)
+            + target_ids
+            + [PAD_ID] * N_TERMINATOR_PADS
+            + [IGNORE_LABEL_ID] * n_trailing
+        )
+
+        # Aux (dual-head) labels align to wherever the answer digits sit.
+        aux_labels = [IGNORE_LABEL_ID] * max_len
+        if len(inter_list) > 0:
+            target_len = len(result_ids)
+            if len(inter_list) >= target_len:
+                aligned_inter = inter_list[-target_len:]
+            else:
+                aligned_inter = [0] * (target_len - len(inter_list)) + inter_list
+
+            result_start = len(prompt_ids) + (len(target_ids) - len(result_ids))
+            aux_labels[result_start:result_start + target_len] = aligned_inter
+
+        assert len(input_ids) == len(lm_labels) == len(aux_labels) == max_len
+
         inputs_list.append(input_ids)
         labels_lm_list.append(lm_labels)
         labels_aux_list.append(aux_labels)
@@ -645,20 +657,20 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
     group_indices = [0]
     puzzle_identifiers = []
 
+    # Every sequence is already exactly max_len (prompt + fixed mask field),
+    # so there is nothing to pad. Verify rather than silently reshape:
+    # truncation here was previously how overlong OOD examples got corrupted.
     for idx, (inp, lm, aux) in enumerate(zip(inputs_list, labels_lm_list, labels_aux_list)):
-        pad_len = max_len - len(inp)
-        if pad_len < 0:
-             # Truncate if too long (should not happen if args correct, but safety)
-             # print(f"Warning: Example {idx} exceeds max_len {max_len} (len={len(inp)}). Truncating.")
-             inp = inp[:max_len]
-             lm = lm[:max_len]
-             aux = aux[:max_len]
-             pad_len = 0
-        
-        padded_inputs.append(inp + [PAD_ID] * pad_len)
-        padded_lm.append(lm + [IGNORE_LABEL_ID] * pad_len)
-        padded_aux.append(aux + [IGNORE_LABEL_ID] * pad_len)
-        
+        if not (len(inp) == len(lm) == len(aux) == max_len):
+            raise ValueError(
+                f"Example {idx} has inconsistent length: "
+                f"inputs={len(inp)}, labels={len(lm)}, aux={len(aux)}, expected {max_len}"
+            )
+
+        padded_inputs.append(inp)
+        padded_lm.append(lm)
+        padded_aux.append(aux)
+
         puzzle_indices.append(idx + 1)
         group_indices.append(idx + 1)
         puzzle_identifiers.append(0)
@@ -677,10 +689,9 @@ def process_and_save_split(data_items: List[Dict], output_dir: str, split_name: 
     
     metadata = {
         "seq_len": max_len,
-        "seq_len": max_len,
         "vocab_size": vocab_size,
         "pad_id": PAD_ID,
-        "pad_id": PAD_ID,
+        "mask_id": MASK_ID,
         "ignore_label_id": IGNORE_LABEL_ID,
         "blank_identifier_id": 0,
         "num_puzzle_identifiers": 1,
@@ -706,11 +717,21 @@ def main():
     parser.add_argument("--num_train", type=int, default=10000)
     parser.add_argument("--num_val", type=int, default=1000)
     parser.add_argument("--num_test", type=int, default=1000)
-    parser.add_argument("--train_max_result_digits", type=int, default=8)
-    parser.add_argument("--test_max_result_digits", type=int, default=12)
+    # NOTE: these bound the MAX OPERAND digit length, not the result length.
+    # The old names are kept so existing command lines keep working, but the
+    # semantics changed: operand length is now the single ID/OOD definition,
+    # shared by the sampler, the eval harness and the SLM path.
+    parser.add_argument("--train_max_result_digits", "--train_max_digits",
+                        dest="train_max_digits", type=int, default=8,
+                        help="Max operand digits for the train and val (ID) splits")
+    parser.add_argument("--test_max_result_digits", "--test_max_digits",
+                        dest="test_max_digits", type=int, default=12,
+                        help="Max operand digits for the test (OOD) split")
     parser.add_argument("--allow_zero", action="store_true", help="Allow 0 operands")
-    parser.add_argument("--max_len", type=int, required=True, help="Padded sequence length (e.g., 256 for 32-digit ops)")
-    parser.add_argument("--dataset_mode", type=str, default="basicfour_concat", choices=["vanilla", "lilavati1", "lilavati2", "lilavati3", "basicfour_concat", "basic_concat_reverse"], help="Dataset mode")
+    parser.add_argument("--max_divisor_digits", type=int, default=3,
+                        help="Cap on divisor length, so long-division remainders stay constant-width")
+    parser.add_argument("--max_len", type=int, required=True, help="Padded sequence length (e.g., 512 for 32-digit ops)")
+    parser.add_argument("--dataset_mode", type=str, default="basicfour_concat", choices=["vanilla", "basicfour_concat", "basic_concat_reverse"], help="Dataset mode")
     
     args = parser.parse_args()
     
@@ -760,44 +781,38 @@ def main():
             self.dataset_mode = dataset_mode
     config = Config(dataset_mode) # Using the dataset_mode defined above
     
-    vocab_size = 17  # 0..16 (vanilla: max token is '=' at 16)
-    CAR_TOKEN_ID = None
-    
-    # BasicFour Concat mode: unique CAR tokens
+    vocab_size = VOCAB_SIZE_PLAIN  # 0..17 (no state tokens)
+
+    # BasicFour Concat modes add the op-specific state markers, the answer
+    # marker and the value separator. Keep this in sync with VOCAB_MAP and
+    # with the inverse map in evaluators/harness.py.
     if config.dataset_mode in ["basicfour_concat", "basic_concat_reverse"]:
-        # Add Operation-specific CAR tokens
-        # 14: <CAR_+>
-        # 15: <CAR_->
-        # 16: <CAR_*>
-        # 17: <CAR_/>
         vocab_map['<CAR_+>'] = 18
         vocab_map['<CAR_->'] = 19
         vocab_map['<CAR_*>'] = 20
         vocab_map['<CAR_/>'] = 21
         vocab_map['<RES>'] = 22
-        vocab_size = 23
-        # We don't have a single CAR_TOKEN_ID anymore, but we can define a map or handle it per op
-        CAR_TOKENS = {'+': 18, '-': 19, '*': 20, '/': 21}
-        CAR_TOKEN_ID = None # Should not be used generically
-        # Add RES token if needed (ID 22) - already in VOCAB_MAP globally but we need to account for it in size
-        vocab_size = 23 # 0..22
-    
+        vocab_map['<SEP>'] = 23
+        vocab_size = VOCAB_SIZE_STATE  # 0..23
+
     for op in OPS:
         sampler = Sampler(
             op, 
-            args.train_max_result_digits, 
-            args.test_max_result_digits,
+            args.train_max_digits,
+            args.test_max_digits,
             allow_zero=args.allow_zero,
-            seed=args.seed + ord(op)
+            seed=args.seed + ord(op),
+            max_divisor_digits=args.max_divisor_digits,
         )
         
         for split, num_examples in splits_config:
-            is_train = (split == "train")
-            # Divide num_examples by 4 if total? User said: "counts per split and per op". 
-            # Usually --num_examples is total. But here arguments say num_train.
-            # Let's assume passed nums are TOTAL across all ops, so we divide by 4.
-            # Or assume per op? The prompt says "Balance by operation".
-            # Safest is target_per_op = num // 4.
+            # val is an IN-DISTRIBUTION held-out split and must be sampled
+            # from the same length range as train. Previously only "train"
+            # set this flag, so val was drawn from the OOD range and every
+            # number reported as "ID" was actually measured out of
+            # distribution.
+            is_train = split in ("train", "val")
+            # Counts are totals across all four operations.
             target = max(1, num_examples // 4)
             
             count = 0
@@ -872,6 +887,15 @@ def main():
                 res_len = len(data["Y"])
                 if op == "/" and data["Y"].startswith("-"): res_len -= 1 # Handle negative if any
                 stats["hist_result_digits"][res_len] += 1
+                # Operand-length histogram is the one that matches the ID/OOD
+                # definition, so it must actually be populated -- it was
+                # declared and left empty before, which is why the realised
+                # length distribution was never checkable.
+                operand_len = max(len(data["A"]), len(data["B"]))
+                key = f"{split}_{operand_len}"
+                stats["hist_operand_max_digits"][key] = (
+                    stats["hist_operand_max_digits"].get(key, 0) + 1
+                )
                 
                 if count < 2 and split == "train":
                     example_buffer.append(structured_obj)

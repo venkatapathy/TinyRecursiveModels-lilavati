@@ -17,7 +17,7 @@ data_paths_test: ['data/icml/reverse']
 
 # Evaluators
 evaluators:
-  - name: basicfour@BasicFourEvaluator
+  - name: harness@ArithmeticEvaluator
 
 # Dataset mode
 dataset_mode: "basic_concat_reverse"
@@ -49,3 +49,6 @@ arch:
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
   carry_loss_weight: 1.0
+seed: 42
+max_len: 512
+eval_split: val

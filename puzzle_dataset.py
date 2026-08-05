@@ -31,9 +31,12 @@ def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indi
 
         append_size = min(puzzle_size, global_batch_size - current_size)
 
-        # Put into batch
+        # Put into batch.
+        # Use the seeded `rng` rather than the global numpy RNG -- the global
+        # one is never seeded, so this line made batch composition
+        # irreproducible even at a fixed config.seed.
         batch_puzzle_indices.append(np.full(append_size, puzzle_id, dtype=np.int32))
-        batch.append(puzzle_start + np.random.choice(puzzle_size, append_size, replace=False))
+        batch.append(puzzle_start + rng.choice(puzzle_size, append_size, replace=False))
 
         current_size += append_size
 

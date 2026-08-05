@@ -5,6 +5,10 @@ class PuzzleDatasetMetadata(BaseModel):
     seq_len: int
     vocab_size: int
     pad_id: int
+    # Id of the placeholder token filling the output field. Present for
+    # datasets built with the masked-field formulation; absent for legacy
+    # (leaky) datasets, which is a useful way to tell them apart.
+    mask_id: Optional[int] = None
     ignore_label_id: int
     blank_identifier_id: int
     num_puzzle_identifiers: int
